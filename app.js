@@ -11,37 +11,104 @@ const gbp = L.gbp, dmy = L.dmy;
 const num = v => { const n = parseFloat(v); return isNaN(n) ? 0 : n; };
 const qtyFmt = n => (Math.round(n * 100) / 100).toString();
 
-/* ================= storage ================= */
+/* ================= storage + change tracking ================= */
 const KEYS = ['clients', 'invoices', 'items', 'expenses', 'projects', 'settings', 'imported'];
+const SEED_CLIENT = 'seed-sewing-studio', SEED_ITEM = 'seed-content-work';
+const MAIL_SUBJECT = '{kind} {number} from {business}';
+const MAIL_BODY = 'Hi {contact},\n\nPlease find {kind_lc} {number} for {total} attached. {duelabel} {due}.\n\nIf you have any questions just reply to this email.\n\nKind regards,\n{business}';
 const DEFAULT_SETTINGS = {
   name: 'James Moriarty', tagline: 'Product photography & video', address: 'Cornwall, UK', email: '', phone: '', vatNumber: '',
   bankName: '', accountName: '', sortCode: '', accountNumber: '', payRef: true,
   terms: 14, invPrefix: 'INV-', estPrefix: 'EST-', nextInvoice: 1, nextEstimate: 1, estValidDays: 30,
   vatDefaultOn: false, vatRate: 20, lateNote: false,
-  accent: '#008080', template: 'classic', logo: '', footer: 'Thank you for your business.', seeded: false, preDemo: null
+  accent: '#008080', template: 'classic', logo: '', footer: 'Thank you for your business.', seeded: false, preDemo: null,
+  googleClientId: '', mailSubject: MAIL_SUBJECT, mailBody: MAIL_BODY, mailBccSelf: false, driveRoot: 'Invoice GoGo', driveOnSend: false, driveOnPaid: false
 };
 const LATE_NOTE = 'Statutory interest may be charged on late payments under the Late Payment of Commercial Debts (Interest) Act 1998.';
 const DEFAULTS = { clients: [], invoices: [], items: [], expenses: [], projects: [], settings: DEFAULT_SETTINGS, imported: {} };
 const CATEGORIES = ['Equipment', 'Software & subscriptions', 'Travel & transport', 'Materials & props', 'Insurance', 'Marketing', 'Phone & internet', 'Training', 'Accountancy & fees', 'Other'];
 let db = {};
+/* sync metadata (localStorage igg_sync): base = hash of each record as last synced/saved, dirty = ids waiting to upload, tombs = deletions, ts = timestamps for settings/imported */
+let S = { base: {}, tombs: {}, dirty: {}, ts: { settings: 0, imported: {} }, cloudInit: false, lastSync: 0, pendImg: {} };
+const stable = o => JSON.stringify(o, (k, v) => (v && typeof v === 'object' && !Array.isArray(v) ? Object.keys(v).sort().reduce((a, x) => { a[x] = v[x]; return a; }, {}) : v));
+const hashStr = s => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h) ^ s.charCodeAt(i); return (h >>> 0).toString(36) + s.length.toString(36); };
+function snap(k) {
+  if (k === 'settings') return { settings: db.settings };
+  if (k === 'imported') { const o = {}; Object.keys(db.imported).forEach(key => { o[key] = { invoiceId: db.imported[key] }; }); return o; }
+  const o = {}; db[k].forEach(r => { o[r.id] = r; }); return o;
+}
+function hashOf(k, rec) { if (k === 'settings' || k === 'imported') return hashStr(stable(rec)); const { updatedAt, ...rest } = rec; return hashStr(stable(rest)); }
+const getTs = (k, id, rec) => (k === 'settings' ? S.ts.settings : k === 'imported' ? (S.ts.imported[id] || 0) : (rec && rec.updatedAt) || 0);
+function setTs(k, id, rec, ts) { if (k === 'settings') S.ts.settings = ts; else if (k === 'imported') S.ts.imported[id] = ts; else rec.updatedAt = ts; }
+/** compare current data with what was last synced; stamp changed records with updatedAt and queue them */
+function stamp(k) {
+  const cur = snap(k), base = S.base[k], now = Date.now(); let ch = false;
+  for (const id in cur) { const h = hashOf(k, cur[id]); if (base[id] !== h) { base[id] = h; S.dirty[k][id] = 1; delete S.tombs[k][id]; setTs(k, id, cur[id], now); ch = true; } }
+  for (const id in base) if (!(id in cur)) { delete base[id]; S.tombs[k][id] = now; S.dirty[k][id] = 1; if (k === 'imported') delete S.ts.imported[id]; ch = true; }
+  return ch;
+}
+function toWire(k, id) {
+  const cur = snap(k);
+  if (!(id in cur)) return S.tombs[k][id] ? { id, deleted: true, updatedAt: S.tombs[k][id] } : null;
+  if (k === 'settings') return Object.assign({ id: 'settings', updatedAt: S.ts.settings }, clone(db.settings));
+  if (k === 'imported') return { id, invoiceId: db.imported[id], updatedAt: S.ts.imported[id] || Date.now() };
+  return clone(cur[id]);
+}
+let storageWarned = false;
+const lsSet = (key, v) => { try { localStorage.setItem(key, JSON.stringify(v)); return true; } catch (e) { if (!storageWarned) { storageWarned = true; toast('Storage is full – export a backup and remove big receipt photos.'); } return false; } };
+const writeKey = k => lsSet('igg_' + k, db[k]);
+const writeSync = () => lsSet('igg_sync', S);
+function save(k) { const ch = stamp(k); writeKey(k); writeSync(); if (ch) scheduleSync(); }
+const saveAll = () => { let ch = false; KEYS.forEach(k => { ch = stamp(k) || ch; writeKey(k); }); writeSync(); if (ch) scheduleSync(); };
+function resetSyncMeta() { S = { base: {}, tombs: {}, dirty: {}, ts: { settings: 0, imported: {} }, cloudInit: S.cloudInit, lastSync: 0, pendImg: S.pendImg || {} }; KEYS.forEach(k => { S.base[k] = {}; S.tombs[k] = {}; S.dirty[k] = {}; }); }
 function load() {
   KEYS.forEach(k => {
     let v = null; try { v = JSON.parse(localStorage.getItem('igg_' + k)); } catch (e) { v = null; }
     db[k] = v == null ? clone(DEFAULTS[k]) : v;
   });
   db.settings = Object.assign({}, DEFAULT_SETTINGS, db.settings);
-  if (!db.settings.seeded) {
-    db.clients.push({ id: uid(), name: 'The Sewing Studio', contact: '', email: '', phone: '', address: '10 Chapel Street\nRedruth\nCornwall', notes: 'Regular client – hours imported from the timesheet app.' });
-    db.items.push({ id: uid(), name: 'Content work', description: 'Product photography, video & editing', rate: 22, unit: 'hour' });
-    db.settings.seeded = true; KEYS.forEach(save);
+  let m = null; try { m = JSON.parse(localStorage.getItem('igg_sync')); } catch (e) { m = null; }
+  resetSyncMeta(); if (m) { S = Object.assign(S, m); S.ts = Object.assign({ settings: 0, imported: {} }, m.ts); S.pendImg = m.pendImg || {}; }
+  KEYS.forEach(k => { S.base[k] = S.base[k] || {}; S.tombs[k] = S.tombs[k] || {}; S.dirty[k] = S.dirty[k] || {}; });
+  normaliseLegacy(); saveAll();
+}
+/** one-time tidy-ups for data made by the first (local-only) version: stable ids for the seeded client/item, images as refs */
+function normaliseLegacy() {
+  const c = db.clients.find(x => x.name === 'The Sewing Studio' && /^10 Chapel Street/.test(x.address || '') && x.id !== SEED_CLIENT);
+  if (c && !db.clients.some(x => x.id === SEED_CLIENT)) { const old = c.id; c.id = SEED_CLIENT; db.invoices.forEach(d => { if (d.clientId === old) d.clientId = SEED_CLIENT; }); db.projects.forEach(p => { if (p.clientId === old) p.clientId = SEED_CLIENT; }); }
+  const it = db.items.find(x => x.name === 'Content work' && x.id !== SEED_ITEM && !db.items.some(y => y.id === SEED_ITEM));
+  if (it) it.id = SEED_ITEM;
+  if (typeof db.settings.logo === 'string' && db.settings.logo.startsWith('data:')) db.settings.logo = saveImg(db.settings.logo);
+  db.expenses.forEach(x => { if (typeof x.receipt === 'string' && x.receipt.startsWith('data:')) x.receipt = saveImg(x.receipt); });
+}
+/** first-run seeding happens only after the first cloud sync, so a second device never re-creates (or resurrects) seed records */
+function maybeSeed() {
+  if (db.settings.seeded) return;
+  if (!db.clients.length && !db.items.length) {
+    db.clients.push({ id: SEED_CLIENT, name: 'The Sewing Studio', contact: '', email: '', phone: '', address: '10 Chapel Street\nRedruth\nCornwall', notes: 'Regular client – hours imported from the timesheet app.' });
+    db.items.push({ id: SEED_ITEM, name: 'Content work', description: 'Product photography, video & editing', rate: 22, unit: 'hour' });
   }
+  db.settings.seeded = true; saveAll();
 }
-let storageWarned = false;
-function save(k) {
-  try { localStorage.setItem('igg_' + k, JSON.stringify(db[k])); }
-  catch (e) { if (!storageWarned) { storageWarned = true; toast('Storage is full – export a backup and remove big receipt photos.'); } }
+
+/* ---- images: stored as separate blobs; records hold 'img:<id>' refs; data URLs live in IndexedDB + memory ---- */
+const IMG = {}; let idbP = null;
+function idb() { return idbP || (idbP = new Promise((res, rej) => { const r = indexedDB.open('igg_img', 1); r.onupgradeneeded = () => r.result.createObjectStore('i'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); })); }
+const idbGet = k => idb().then(d => new Promise(res => { const q = d.transaction('i').objectStore('i').get(k); q.onsuccess = () => res(q.result || null); q.onerror = () => res(null); })).catch(() => null);
+const idbSet = (k, v) => idb().then(d => new Promise(res => { const tx = d.transaction('i', 'readwrite'); tx.objectStore('i').put(v, k); tx.oncomplete = () => res(true); tx.onerror = () => res(false); })).catch(() => false);
+function saveImg(dataURL) { const ref = 'img:' + uid(); IMG[ref] = dataURL; idbSet(ref, dataURL); S.pendImg[ref] = 1; writeSync(); scheduleSync(); return ref; }
+const imgLoading = {};
+function loadImg(ref) {
+  if (IMG[ref]) return Promise.resolve(IMG[ref]); if (imgLoading[ref]) return imgLoading[ref];
+  imgLoading[ref] = (async () => {
+    let v = await idbGet(ref);
+    if (!v && getTok()) { try { const r = await fetch('/api/' + ref.replace(':', '/'), { headers: { authorization: 'Bearer ' + getTok() } }); if (r.ok) { v = await r.text(); idbSet(ref, v); } } catch (e) { /* offline – try later */ } }
+    delete imgLoading[ref]; if (v) { IMG[ref] = v; hydrateImages(); } return v;
+  })();
+  return imgLoading[ref];
 }
-const saveAll = () => KEYS.forEach(save);
+function imgSrc(ref) { if (!ref) return ''; if (ref.startsWith('data:')) return ref; if (IMG[ref]) return IMG[ref]; loadImg(ref); return ''; }
+function hydrateImages() { $$('img[data-ref]').forEach(el => { const s = imgSrc(el.dataset.ref); if (s && el.getAttribute('src') !== s) el.src = s; }); }
 
 /* ================= helpers ================= */
 const clientOf = id => db.clients.find(c => c.id === id);
@@ -109,11 +176,13 @@ const csvCell = v => { const s = String(v == null ? '' : v); return /[",\n\r]/.t
 const toCSV = rows => rows.map(r => r.map(csvCell).join(',')).join('\r\n') + '\r\n';
 
 /* ================= modal ================= */
-function modal(title, bodyHTML, buttons) {
+function modal(title, bodyHTML, buttons, opts) {
+  opts = opts || {};
   closeModal();
   const bg = document.createElement('div'); bg.id = 'modalBg';
   bg.innerHTML = `<div class="modal" role="dialog" aria-label="${esc(title)}"><h3>${esc(title)}</h3><div id="modalBody">${bodyHTML}</div><div class="foot">${(buttons || []).map((b, i) => `<button class="btn ${b.cls || ''}" data-mb="${i}">${esc(b.label)}</button>`).join('')}</div></div>`;
-  bg.addEventListener('mousedown', e => { if (e.target === bg) closeModal(); });
+  if (opts.sticky) bg.dataset.sticky = '1';
+  bg.addEventListener('mousedown', e => { if (e.target === bg && !opts.sticky) closeModal(); });
   bg.addEventListener('click', e => {
     const b = e.target.closest('[data-mb]'); if (!b) return;
     const def = buttons[+b.dataset.mb]; const r = def.fn ? def.fn(bg) : undefined; if (r !== false) closeModal();
@@ -123,7 +192,7 @@ function modal(title, bodyHTML, buttons) {
   return bg;
 }
 function closeModal() { const m = $('#modalBg'); if (m) m.remove(); }
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeModal(); $('#newMenu') && $('#newMenu').remove(); } });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { const m = $('#modalBg'); if (!(m && m.dataset.sticky)) closeModal(); $('#newMenu') && $('#newMenu').remove(); } });
 
 /** field spec -> html; values -> object */
 function fieldsHTML(fields, v) {
@@ -182,7 +251,7 @@ function renderPaper(d, opts) {
   return `<div class="paper t-${esc(s.template)}" id="paper" style="--acc:${esc(acc)};--on-acc:${onColour(acc)}">
   ${stamp}
   <div class="p-head">
-    <div>${s.logo ? `<img class="p-logo" src="${s.logo}" alt="">` : ''}<div class="p-biz">${esc(s.name || 'Your business')}</div>
+    <div>${s.logo ? `<img class="p-logo" data-ref="${esc(s.logo)}" src="${esc(imgSrc(s.logo))}" alt="">` : ''}<div class="p-biz">${esc(s.name || 'Your business')}</div>
       ${s.tagline && !s.logo ? `<div class="p-addr">${esc(s.tagline)}</div>` : ''}
       <div class="p-addr">${esc([s.address, s.email, s.phone].filter(Boolean).join('\n'))}${s.vatNumber ? '\nVAT no. ' + esc(s.vatNumber) : ''}</div></div>
     <div><div class="p-title">${isEst ? 'Estimate' : (s.vatDefaultOn || d.vatOn ? 'Tax Invoice' : 'Invoice')}</div>
@@ -220,7 +289,7 @@ const NAV = [
 const TABS = [['dashboard', 'Home', 'home'], ['invoices', 'Invoices', 'invoices'], ['clients', 'Clients', 'clients'], ['expenses', 'Expenses', 'expenses'], ['more', 'More', 'more']];
 
 function buildShell() {
-  $('#topbar').innerHTML = `<a class="brand" href="#/dashboard"><img src="icon.svg" alt=""><span class="nm">Invoice <b>GoGo</b></span></a><div class="top-spacer"></div>
+  $('#topbar').innerHTML = `<a class="brand" href="#/dashboard"><img src="icon.svg" alt=""><span class="nm">Invoice <b>GoGo</b></span></a><div class="top-spacer"></div><button class="sync-ind" id="syncInd" data-act="syncNow" title="Cloud sync"></button>
     <button class="btn-grey" id="btnNew" aria-haspopup="true">${ico('plus')} New</button>`;
   $('#sidebar').innerHTML = NAV.map((n, i) => `${i === 3 || i === 7 || i === 9 ? '<div class="sep"></div>' : ''}<a href="#/${n[0]}" data-nav="${n[0]}">${ico(n[2])}<span>${n[1]}</span></a>`).join('');
   $('#tabbar').innerHTML = TABS.map(n => `<a href="#/${n[0]}" data-nav="${n[0]}">${ico(n[2])}<span>${n[1]}</span></a>`).join('');
@@ -262,6 +331,7 @@ function render() {
   try { page.innerHTML = fn(parts) || page.innerHTML; } catch (e) { console.error(e); page.innerHTML = `<div class="card"><b>Something went wrong.</b><pre>${esc(e.stack || e)}</pre></div>`; }
   window.scrollTo(0, 0);
   const after = VIEWS['after_' + route]; if (after) after(parts);
+  hydrateImages(); paintSync();
 }
 window.addEventListener('hashchange', render);
 
@@ -490,6 +560,7 @@ VIEWS.docView = function (parts) {
   acts.push(`<a class="btn" href="#/${d.type}s">‹ Back</a>`);
   acts.push(`<button class="btn primary" data-act="print">${ico('print')} Print / Save as PDF</button>`);
   acts.push(`<button class="btn" data-act="pdf" data-id="${d.id}">Download PDF</button>`);
+  acts.push(`<button class="btn primary" data-act="emailDoc" data-id="${d.id}">✉ Email to client</button><button class="btn" data-act="driveDoc" data-id="${d.id}">Save to Drive</button>`);
   if (!isEst && st === 'draft') acts.push(`<button class="btn fawn" data-act="markSent" data-id="${d.id}">Mark as sent</button>`);
   if (!isEst && st !== 'paid' && st !== 'draft') acts.push(`<button class="btn fawn" data-act="markPaid" data-id="${d.id}">Mark paid</button>`);
   if (!isEst && st === 'paid') acts.push(`<button class="btn" data-act="markUnpaid" data-id="${d.id}">Mark unpaid</button>`);
@@ -500,40 +571,26 @@ VIEWS.docView = function (parts) {
   }
   if (isEst && d.convertedTo && docOf(d.convertedTo)) acts.push(`<a class="btn" href="#/invoice/${d.convertedTo}">View ${esc(docOf(d.convertedTo).number)}</a>`);
   acts.push(`<a class="btn" href="#/${d.type}/${d.id}/edit">Edit</a>`);
-  if (c.email) acts.push(`<a class="btn" href="mailto:${esc(c.email)}?subject=${encodeURIComponent((isEst ? 'Estimate ' : 'Invoice ') + d.number + ' from ' + (db.settings.name || ''))}&body=${encodeURIComponent('Hi ' + (c.contact || c.name) + ',\n\nPlease find ' + (isEst ? 'estimate ' : 'invoice ') + d.number + ' for ' + gbp(docTotal(d)) + ' attached (' + (isEst ? 'valid until ' : 'due ') + dmy(d.dueDate) + ').\n\nKind regards,\n' + (db.settings.name || ''))}">Email client</a>`);
+  if (c.email) acts.push(`<a class="btn" href="mailto:${esc(c.email)}?subject=${encodeURIComponent((isEst ? 'Estimate ' : 'Invoice ') + d.number + ' from ' + (db.settings.name || ''))}&body=${encodeURIComponent('Hi ' + (c.contact || c.name) + ',\n\nPlease find ' + (isEst ? 'estimate ' : 'invoice ') + d.number + ' for ' + gbp(docTotal(d)) + ' attached (' + (isEst ? 'valid until ' : 'due ') + dmy(d.dueDate) + ').\n\nKind regards,\n' + (db.settings.name || ''))}">Open in mail app (no PDF)</a>`);
   acts.push(`<button class="btn" data-act="duplicate" data-id="${d.id}">Duplicate</button><button class="btn danger" data-act="delDoc" data-id="${d.id}">Delete</button>`);
   return `<div class="page-head"><h1>${esc(d.number)} ${badge(d)}${demoBadge(d)}</h1><span class="sub">${esc(c.name || '')} · ${gbp(docTotal(d))}</span></div>
   <div class="doc-actions">${acts.join('')}</div>
   ${d.sessionKeys && d.sessionKeys.length ? `<div class="note no-print" style="margin-bottom:.7rem">Created from ${d.sessionKeys.length} timesheet sessions.</div>` : ''}
+  ${d.sentAt ? `<div class="note no-print" style="margin-bottom:.4rem">✉ Emailed to ${esc(d.sentTo || '')} on ${dmy(d.sentAt)}</div>` : ''}${d.driveLink || d.drivePath ? `<div class="note no-print" style="margin-bottom:.7rem">☁ Saved to Drive: ${d.driveLink ? `<a href="${esc(d.driveLink)}" target="_blank" rel="noopener">${esc(d.drivePath || 'Open')}</a>` : esc(d.drivePath)} (${new Date(d.driveSavedAt).toLocaleDateString('en-GB')})</div>` : ''}
   <div class="doc-wrap">${renderPaper(d)}</div>
   <div class="note no-print" style="text-align:center;margin-top:.8rem">Tip: in the print dialog choose “Save as PDF” and turn off “Headers and footers”. Mark as sent after you've sent it – only sent invoices become overdue.</div>`;
 };
 ACT.print = () => window.print();
-function loadScript(src) { return new Promise((res, rej) => { const el = document.createElement('script'); el.src = src; el.onload = res; el.onerror = () => rej(new Error('Could not load ' + src)); document.head.appendChild(el); }); }
-ACT.pdf = async el => {
-  const d = docOf(el.dataset.id);
-  try {
-    toast('Building PDF…');
-    if (!window.html2canvas) await loadScript('https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js');
-    if (!window.jspdf) await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js');
-    const host = document.createElement('div'); host.className = 'pdf-capture'; host.style.cssText = 'position:fixed;left:-10000px;top:0;width:794px;background:#fff'; host.innerHTML = renderPaper(d); document.body.appendChild(host);
-    const paper = host.firstElementChild; await new Promise(r => setTimeout(r, 60));
-    const canvas = await window.html2canvas(paper, { scale: 2, backgroundColor: '#ffffff', useCORS: true }); host.remove();
-    const pdf = new window.jspdf.jsPDF({ unit: 'pt', format: 'a4' }); const pw = pdf.internal.pageSize.getWidth(), ph = pdf.internal.pageSize.getHeight();
-    const imgH = canvas.height * pw / canvas.width, img = canvas.toDataURL('image/jpeg', 0.92);
-    let y = 0, left = imgH;
-    if (imgH > ph && imgH <= ph * 1.1) { const k = ph / imgH; pdf.addImage(img, 'JPEG', (pw - pw * k) / 2, 0, pw * k, ph); left = 0; } // slightly long: shrink to one page
-    else { pdf.addImage(img, 'JPEG', 0, 0, pw, imgH); left -= ph; }
-    while (left > 2) { pdf.addPage(); y -= ph; pdf.addImage(img, 'JPEG', 0, y, pw, imgH); left -= ph; }
-    pdf.save(d.number + '.pdf'); toast('PDF downloaded');
-  } catch (e) { console.warn(e); const h = $('.pdf-capture'); if (h) h.remove(); toast('PDF download needs internet – opening Print / Save as PDF instead'); setTimeout(() => window.print(), 600); }
-};
+
 ACT.markSent = el => { const d = docOf(el.dataset.id); d.status = 'sent'; save('invoices'); toast('Marked as sent'); render(); };
 ACT.markUnpaid = el => { const d = docOf(el.dataset.id); d.status = 'sent'; d.paidDate = ''; save('invoices'); render(); };
 ACT.markPaid = el => {
-  const d = docOf(el.dataset.id);
+  let d = docOf(el.dataset.id);
   modal('Mark ' + d.number + ' as paid', `<div class="fg"><label>Date received</label><input type="date" id="paidDate" value="${L.todayYMD()}"></div><div class="note">Amount: <b>${gbp(docTotal(d))}</b> from ${esc(clientName(d.clientId))}</div>`,
-    [{ label: 'Cancel' }, { label: 'Mark paid', cls: 'primary', fn: m => { const v = $('#paidDate', m).value; if (!v) { toast('Pick a date'); return false; } d.status = 'paid'; d.paidDate = v; save('invoices'); toast('Marked as paid'); render(); } }]);
+    [{ label: 'Cancel' }, { label: 'Mark paid', cls: 'primary', fn: m => { const v = $('#paidDate', m).value; if (!v) { toast('Pick a date'); return false; }
+      const tokP = db.settings.driveOnPaid && hasGoogleId() ? googleToken() : null; // pop-up must start inside this click
+      d = docOf(d.id) || d; d.status = 'paid'; d.paidDate = v; save('invoices'); toast('Marked as paid'); render();
+      if (tokP) tokP.then(tok => driveSave(d, tok)).then(() => { toast('Marked as paid and saved to Drive'); render(); }).catch(e => toast('Marked as paid, but the Drive save failed: ' + e.message)); } }]);
 };
 ACT.estStatus = el => { const d = docOf(el.dataset.id); d.status = el.dataset.v; save('invoices'); render(); };
 ACT.convert = el => {
@@ -646,7 +703,7 @@ function editExpense(id) {
   const fields = [{ k: 'date', label: 'Date', type: 'date', req: 1 }, { k: 'category', label: 'Category', type: 'select', options: CATEGORIES }, { k: 'amount', label: 'Amount (£)', type: 'number', step: '0.01', req: 1 },
     { k: 'note', label: 'Note (what / who)' }, { k: 'projectId', label: 'Project (optional)', type: 'select', options: [['', '— none —']].concat(db.projects.map(p => [p.id, p.name])) }, { k: 'receipt', label: 'Receipt photo', type: 'image' }];
   const extra = id ? [{ label: 'Delete', cls: 'danger', fn: () => { if (!confirm('Delete this expense?')) return false; db.expenses = db.expenses.filter(e => e.id !== id); save('expenses'); render(); } }] : [];
-  formModal(id ? 'Edit expense' : 'New expense', fields, x, out => { out.amount = num(out.amount); if (id) Object.assign(x, out); else db.expenses.push(out); save('expenses'); toast('Expense saved'); render(); }, extra);
+  formModal(id ? 'Edit expense' : 'New expense', fields, x, out => { out.amount = num(out.amount); if (out.receipt && out.receipt.startsWith('data:')) out.receipt = saveImg(out.receipt); if (id) Object.assign(x, out); else db.expenses.push(out); save('expenses'); toast('Expense saved'); render(); }, extra);
 }
 let expFilter = { cat: '', month: '' };
 VIEWS.expenses = function () {
@@ -657,12 +714,12 @@ VIEWS.expenses = function () {
   return `<div class="page-head"><h1>Expenses</h1><span class="sp"></span><button class="btn" data-act="expCSV">Export CSV</button><button class="btn primary" data-act="newExpense">${ico('plus')} New expense</button></div>
   <div class="card"><div class="row2" style="margin-bottom:.8rem"><select data-xf="cat"><option value="">All categories</option>${CATEGORIES.map(c => `<option ${expFilter.cat === c ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
     <select data-xf="month"><option value="">All months</option>${months.map(m => `<option value="${m}" ${expFilter.month === m ? 'selected' : ''}>${L.monthLabel(m)}</option>`).join('')}</select></div>
-  ${rows.length ? `<div class="scroll-x"><table class="t"><thead><tr><th>Date</th><th>Category</th><th>Note</th><th>Project</th><th>Receipt</th><th class="r">Amount</th><th></th></tr></thead><tbody>${rows.map(x => `<tr><td>${dmy(x.date)}</td><td>${esc(x.category)}${demoBadge(x)}</td><td>${esc(x.note)}</td><td>${esc((projectOf(x.projectId) || {}).name || '')}</td><td>${x.receipt ? `<img class="thumb" src="${x.receipt}" data-act="viewReceipt" data-id="${x.id}" alt="Receipt">` : ''}</td><td class="r">${gbp(num(x.amount))}</td><td class="r"><button class="btn small" data-act="editExpense" data-id="${x.id}">Edit</button></td></tr>`).join('')}
+  ${rows.length ? `<div class="scroll-x"><table class="t"><thead><tr><th>Date</th><th>Category</th><th>Note</th><th>Project</th><th>Receipt</th><th class="r">Amount</th><th></th></tr></thead><tbody>${rows.map(x => `<tr><td>${dmy(x.date)}</td><td>${esc(x.category)}${demoBadge(x)}</td><td>${esc(x.note)}</td><td>${esc((projectOf(x.projectId) || {}).name || '')}</td><td>${x.receipt ? `<img class="thumb" data-ref="${esc(x.receipt)}" src="${esc(imgSrc(x.receipt))}" data-act="viewReceipt" data-id="${x.id}" alt="Receipt">` : ''}</td><td class="r">${gbp(num(x.amount))}</td><td class="r"><button class="btn small" data-act="editExpense" data-id="${x.id}">Edit</button></td></tr>`).join('')}
     <tr class="tot"><td colspan="5">Total (${rows.length})</td><td class="r">${gbp(sum(rows, x => num(x.amount)))}</td><td></td></tr></tbody></table></div>` : '<div class="empty"><b>No expenses</b>Log kit, software, travel and anything else you spend on the business.</div>'}</div>`;
 };
 document.addEventListener('change', e => { if (e.target.dataset.xf) { expFilter[e.target.dataset.xf] = e.target.value; render(); } });
 ACT.newExpense = () => editExpense(); ACT.editExpense = el => editExpense(el.dataset.id);
-ACT.viewReceipt = el => { const x = db.expenses.find(e => e.id === el.dataset.id); modal('Receipt – ' + dmy(x.date), `<img src="${x.receipt}" style="width:100%;border-radius:8px" alt="Receipt">`, [{ label: 'Close' }]); };
+ACT.viewReceipt = el => { const x = db.expenses.find(e => e.id === el.dataset.id); modal('Receipt – ' + dmy(x.date), `<img data-ref="${esc(x.receipt)}" src="${esc(imgSrc(x.receipt))}" style="width:100%;border-radius:8px;min-height:60px" alt="Receipt">`, [{ label: 'Close' }]); };
 ACT.expCSV = () => download('invoice-gogo-expenses.csv', toCSV([['Date', 'Category', 'Amount', 'Note', 'Project']].concat(db.expenses.slice().sort((a, b) => a.date.localeCompare(b.date)).map(x => [x.date, x.category, num(x.amount).toFixed(2), x.note, (projectOf(x.projectId) || {}).name || '']))), 'text/csv');
 
 /* ================= Cash flow ================= */
@@ -741,14 +798,16 @@ ACT.invCSV = () => download('invoice-gogo-invoices.csv', toCSV([['Number', 'Type
 VIEWS.apps = function () {
   const card = (icon, title, body, btn) => `<div class="card app-card"><div class="logo">${ico(icon)}</div><div style="flex:1"><h4>${title}</h4><p>${body}</p>${btn || ''}</div></div>`;
   const imported = Object.keys(db.imported).filter(k => docOf(db.imported[k])).length;
+  const gset = hasGoogleId(), sentN = db.invoices.filter(d => d.sentAt).length, driveN = db.invoices.filter(d => d.driveFileId).length;
+  const gBadge = gset ? '<span class="badge b-sent">Client ID set</span>' : '<span class="badge b-overdue">Needs setup</span>';
   return `<div class="page-head"><h1>Integrated apps</h1></div>
   <div class="grid g2">
+  ${card('cashflow', 'Cloud sync (Netlify) <span id="cloudBadge"></span>', `<span id="cloudStatus">${cloudStatusHTML()}</span><br>Your data is stored privately in Netlify Blobs behind your PIN, and kept on each device for offline use.`, `<div class="btn-row"><button class="btn" data-act="syncNow">Sync now</button><a class="btn" href="#/settings">Security</a></div>`)}
+  ${card('invoices', 'Gmail ' + gBadge, gset ? `Emails invoices and estimates from your own Gmail with the PDF attached. ${sentN ? `<b>${sentN}</b> sent so far.` : 'None sent yet.'} Google asks you to approve access the first time (and about weekly while the app is in “Testing”).` : 'Not set up – needs a Google Client ID (free, about 5 minutes). Until then the “Email to client” button shows the setup steps.', `<div class="btn-row"><a class="btn ${gset ? '' : 'primary'}" href="#/settings">${gset ? 'Integrations settings' : 'Set up Google'}</a><button class="btn" data-act="googleHelp">Setup steps</button></div>`)}
+  ${card('drive', 'Google Drive ' + gBadge, gset ? `Saves PDFs to <b>${esc(db.settings.driveRoot || 'Invoice GoGo')} / Client / INV-….pdf</b>${db.settings.driveOnSend || db.settings.driveOnPaid ? ' automatically when ' + [db.settings.driveOnSend && 'emailed', db.settings.driveOnPaid && 'marked paid'].filter(Boolean).join(' or ') : ' (use “Save to Drive” on any invoice, or switch on auto-save in Settings)'}. <b>${driveN}</b> invoice${driveN === 1 ? '' : 's'} saved.` : 'Not set up – uses the same Google Client ID as Gmail. Needs the Drive API enabled.', `<div class="btn-row"><a class="btn" href="#/settings">Integrations settings</a></div>`)}
   ${card('clock', 'Sewing Studio Timesheet <span class="badge b-done">Available</span>', `Turn the hours you log into an invoice in a couple of taps. Export <b>Backup (JSON)</b> or <b>CSV</b> from the timesheet app, then import it here. ${imported ? `<br><b>${imported}</b> sessions already invoiced.` : ''}`, `<div class="btn-row"><a class="btn primary" href="#/import">Import from Sewing Studio Timesheet</a><a class="btn" target="_blank" rel="noopener" href="https://sewing-studio-timesheet.netlify.app/">Open timesheet app</a></div>`)}
-  ${card('drive', 'Google Drive <span class="badge b-draft">Planned</span>', 'Not connected yet. For now: open an invoice → Print / Save as PDF (or Download PDF) and drop the file in your Drive folder. Automatic “save every sent invoice to Drive” is on the wishlist.')}
-  ${card('apps', 'Netlify &amp; GitHub <span class="badge b-draft">Hosting</span>', 'Invoice GoGo is a plain static site, so it deploys straight to Netlify from the GitHub repo. Your invoice data never leaves your device – it lives in this browser\'s storage.')}
   ${card('invoices', 'Accounting software <span class="badge b-draft">Via CSV</span>', 'Xero, QuickBooks, FreeAgent and similar can take a CSV. Use Reports → Export invoices CSV / report CSV. Direct connections are not built.', `<a class="btn" href="#/reports">Open reports</a>`)}
   ${card('cashflow', 'Online card payments <span class="badge b-draft">Planned</span>', 'Stripe / PayPal / GoCardless “Pay now” links are not included. For now invoices show your bank details and a payment reference.')}
-  ${card('settings', 'Backup &amp; sync <span class="badge b-draft">Manual</span>', 'Data is stored on this device only. Use Settings → Backup to move it to your phone or Mac, or to keep a safe copy.', `<a class="btn" href="#/settings">Open settings</a>`)}
   </div>`;
 };
 
@@ -826,7 +885,7 @@ VIEWS.settings = function () {
   <div class="grid g2" style="align-items:start"><div>
   <div class="card"><h3>Your business</h3>${S_TEXT('name', 'Business / your name')}${S_TEXT('tagline', 'Tagline (shown when no logo)')}
     <div class="fg"><label>Address</label><textarea data-s="address">${esc(s.address)}</textarea></div>${S_TEXT('email', 'Email', 'email')}${S_TEXT('phone', 'Phone', 'tel')}${S_TEXT('vatNumber', 'VAT number (only if registered)')}</div>
-  <div class="card"><h3>Payment details</h3><p class="note" style="margin-top:0">Shown on invoices. Stored only on this device.</p>${S_TEXT('bankName', 'Bank name')}${S_TEXT('accountName', 'Account name')}
+  <div class="card"><h3>Payment details</h3><p class="note" style="margin-top:0">Shown on invoices. Kept in your private cloud store (behind your PIN) and on your devices.</p>${S_TEXT('bankName', 'Bank name')}${S_TEXT('accountName', 'Account name')}
     <div class="row2">${S_TEXT('sortCode', 'Sort code', 'text', '00-00-00')}${S_TEXT('accountNumber', 'Account number', 'text', '00000000')}</div>
     <label class="chk"><input type="checkbox" data-s="payRef" ${s.payRef ? 'checked' : ''}> Show invoice number as payment reference</label></div>
   <div class="card"><h3>Invoice defaults</h3>
@@ -836,15 +895,33 @@ VIEWS.settings = function () {
     <label class="chk" style="margin-bottom:.6rem"><input type="checkbox" data-s="vatDefaultOn" ${s.vatDefaultOn ? 'checked' : ''}> Add VAT to new invoices by default <span class="note">(off – only if you're VAT registered)</span></label>
     <label class="chk"><input type="checkbox" data-s="lateNote" ${s.lateNote ? 'checked' : ''}> Add the late-payment (statutory interest) note to new invoices</label>
     <p class="note">“${esc(LATE_NOTE)}”</p></div>
+  <div class="card" id="integrations"><h3>Integrations – Gmail &amp; Google Drive</h3>
+    ${s.googleClientId ? '' : `<div class="callout"><b>Not set up yet.</b> To email invoices from your own Gmail and save PDFs to Drive you need a free Google “Client ID”. It takes about 5 minutes. <button class="btn small" data-act="googleHelp">Show me how</button></div>`}
+    <div class="fg"><label>Google OAuth Client ID</label><input type="text" data-s="googleClientId" value="${esc(s.googleClientId)}" placeholder="1234567890-abc….apps.googleusercontent.com" autocomplete="off" spellcheck="false"></div>
+    <div class="btn-row"><button class="btn primary" data-act="googleConnect">Connect Google</button><button class="btn" data-act="googleHelp">Setup steps</button></div><div id="gStatus" class="note" style="margin:.6rem 0">Allowed origin to register: <code>${esc(location.origin)}</code></div>
+    <hr style="border:none;border-top:1px solid var(--border);margin:.9rem 0">
+    <div class="fg"><label>Email subject</label><input type="text" data-s="mailSubject" value="${esc(s.mailSubject)}"></div>
+    <div class="fg"><label>Email message</label><textarea data-s="mailBody" rows="7">${esc(s.mailBody)}</textarea></div>
+    <p class="note" style="margin-top:-.4rem">Placeholders: {kind} {kind_lc} {number} {total} {due} {duelabel} {client} {contact} {business} {project}</p>
+    <label class="chk" style="margin-bottom:.6rem"><input type="checkbox" data-s="mailBccSelf" ${s.mailBccSelf ? 'checked' : ''}> Bcc myself on emails (needs my email under Your business)</label>
+    <div class="fg"><label>Drive folder name</label><input type="text" data-s="driveRoot" value="${esc(s.driveRoot)}" placeholder="Invoice GoGo"></div>
+    <label class="chk" style="margin-bottom:.5rem"><input type="checkbox" data-s="driveOnSend" ${s.driveOnSend ? 'checked' : ''}> Automatically save the PDF to Drive when I email an invoice</label>
+    <label class="chk"><input type="checkbox" data-s="driveOnPaid" ${s.driveOnPaid ? 'checked' : ''}> Automatically save the PDF to Drive when I mark it paid</label>
+    <p class="note">PDFs are filed as <b>${esc(s.driveRoot || 'Invoice GoGo')} / Client name / INV-0001 - Client.pdf</b>. Saving the same invoice again updates the same file.</p></div>
   </div><div>
   <div class="card"><h3>Invoice design</h3>
     <div class="fg"><label>Template</label><div class="tpl-pick">${['classic', 'modern', 'minimal'].map(t => `<label class="${s.template === t ? 'on' : ''}"><input type="radio" name="tpl" value="${t}" data-s="template" ${s.template === t ? 'checked' : ''}>${t[0].toUpperCase() + t.slice(1)}</label>`).join('')}</div></div>
     <div class="fg"><label>Accent colour</label><div style="display:flex;gap:.6rem;align-items:center;flex-wrap:wrap"><input type="color" data-s="accent" value="${esc(s.accent)}"><input type="text" data-s="accentHex" value="${esc(s.accent)}" style="width:110px" aria-label="Hex colour">
       ${['#008080', '#E5A361', '#1d4ed8', '#9d174d', '#374151', '#15803d'].map(c => `<button class="chip" data-act="setAccent" data-c="${c}" style="background:${c};border-color:${c};width:28px;height:28px;padding:0" aria-label="${c}"></button>`).join('')}</div></div>
-    <div class="fg"><label>Logo</label><div style="display:flex;gap:.8rem;align-items:center;flex-wrap:wrap">${s.logo ? `<img class="logo-prev" src="${s.logo}" alt="Logo">` : '<span class="note">No logo</span>'}<input type="file" id="logoFile" accept="image/*" style="width:auto">${s.logo ? '<button class="btn small danger" data-act="rmLogo">Remove</button>' : ''}</div></div>
+    <div class="fg"><label>Logo</label><div style="display:flex;gap:.8rem;align-items:center;flex-wrap:wrap">${s.logo ? `<img class="logo-prev" data-ref="${esc(s.logo)}" src="${esc(imgSrc(s.logo))}" alt="Logo">` : '<span class="note">No logo</span>'}<input type="file" id="logoFile" accept="image/*" style="width:auto">${s.logo ? '<button class="btn small danger" data-act="rmLogo">Remove</button>' : ''}</div></div>
     ${S_TEXT('footer', 'Footer text')}
     <div class="label note" style="margin-bottom:.4rem">Live preview</div><div id="setPreview" class="doc-wrap"></div></div>
-  <div class="card"><h3>Data &amp; backup</h3><p class="note" style="margin-top:0">Everything is stored in this browser (keys start with <code>igg_</code>). Make a backup before clearing browser data.</p>
+  <div class="card"><h3>Cloud sync &amp; security</h3><p id="cloudStatus" style="margin-top:0">${cloudStatusHTML()}</p>
+    <div class="btn-row"><button class="btn" data-act="syncNow">Sync now</button><button class="btn" data-act="lockDevice">Lock this device</button></div>
+    <hr style="border:none;border-top:1px solid var(--border);margin:.9rem 0"><div class="card-h" style="font-size:.9rem;margin-bottom:.5rem">Change PIN</div>
+    <form id="pinChangeForm" autocomplete="off"><div class="row3"><div class="fg"><label>Current</label><input type="password" id="pcCur" autocomplete="current-password" required></div><div class="fg"><label>New (6+)</label><input type="password" id="pcNew" autocomplete="new-password" required></div><div class="fg"><label>Repeat new</label><input type="password" id="pcRep" autocomplete="new-password" required></div></div>
+    <div id="lockErr" class="lock-err"></div><button class="btn small" type="submit">Change PIN</button></form></div>
+  <div class="card"><h3>Data &amp; backup</h3><p class="note" style="margin-top:0">Your data lives in your private cloud store and is cached on each device. A backup file is still a good idea (it includes logo and receipt photos).</p>
     <div class="btn-row"><button class="btn primary" data-act="backup">Download backup (JSON)</button><label class="btn" for="restoreFile">Restore from backup…</label><input type="file" id="restoreFile" accept=".json,application/json" class="hidden"></div>
     <hr style="border:none;border-top:1px solid var(--border);margin:1rem 0">
     <div class="btn-row"><button class="btn fawn" data-act="loadDemo">Load demo data</button><button class="btn" data-act="removeDemo">Remove demo data</button></div>
@@ -854,7 +931,7 @@ VIEWS.settings = function () {
 };
 VIEWS.after_settings = function () {
   paintSetPreview();
-  $('#logoFile').addEventListener('change', async e => { const f = e.target.files[0]; if (!f) return; try { db.settings.logo = await resizeImage(f, 420, 'image/png'); save('settings'); render(); } catch (err) { toast(err.message); } });
+  $('#logoFile').addEventListener('change', async e => { const f = e.target.files[0]; if (!f) return; try { db.settings.logo = saveImg(await resizeImage(f, 420, 'image/png')); save('settings'); render(); } catch (err) { toast(err.message); } });
   $('#restoreFile').addEventListener('change', e => { const f = e.target.files[0]; if (!f) return; const fr = new FileReader(); fr.onload = () => restore(fr.result); fr.readAsText(f); e.target.value = ''; });
 };
 function paintSetPreview() {
@@ -864,7 +941,7 @@ function paintSetPreview() {
 }
 const HEX = /^#[0-9a-f]{6}$/i;
 function setSetting(el) {
-  const k = el.dataset.s, s = db.settings; let v = el.type === 'checkbox' ? el.checked : el.value;
+  const k = el.dataset.s, s = db.settings; let v = el.type === 'checkbox' ? el.checked : el.value; if (k === 'googleClientId') v = v.trim();
   if (k === 'accentHex') { if (!HEX.test(v)) return; s.accent = v; const c = $('[data-s="accent"]'); if (c) c.value = v; }
   else if (k === 'accent') { s.accent = v; const h = $('[data-s="accentHex"]'); if (h) h.value = v; }
   else if (['terms', 'estValidDays', 'nextInvoice', 'nextEstimate', 'vatRate'].includes(k)) { v = num(v); if (['nextInvoice', 'nextEstimate'].includes(k)) v = Math.max(1, Math.floor(v)); s[k] = v; }
@@ -876,20 +953,29 @@ document.addEventListener('input', e => { if (e.target.dataset.s && e.target.typ
 document.addEventListener('change', e => { if (e.target.dataset.s) setSetting(e.target); });
 ACT.setAccent = el => { db.settings.accent = el.dataset.c; save('settings'); render(); };
 ACT.rmLogo = () => { db.settings.logo = ''; save('settings'); render(); };
-ACT.backup = () => {
+async function inlineImages(data) {
+  const out = clone(data);
+  if (out.settings.logo && out.settings.logo.startsWith('img:')) out.settings.logo = (await loadImg(out.settings.logo)) || '';
+  for (const x of out.expenses) if (x.receipt && x.receipt.startsWith('img:')) x.receipt = (await loadImg(x.receipt)) || '';
+  return out;
+}
+ACT.backup = async () => {
   const data = {}; KEYS.forEach(k => data[k] = db[k]);
-  download('invoice-gogo-backup-' + L.todayYMD() + '.json', JSON.stringify({ app: 'invoice-gogo', version: 1, exported: new Date().toISOString(), data }, null, 1), 'application/json');
+  download('invoice-gogo-backup-' + L.todayYMD() + '.json', JSON.stringify({ app: 'invoice-gogo', version: 2, exported: new Date().toISOString(), data: await inlineImages(data) }, null, 1), 'application/json');
   toast('Backup downloaded');
 };
 function restore(text) {
   try {
     const j = JSON.parse(text); if (!j || j.app !== 'invoice-gogo' || !j.data) throw new Error('not an Invoice GoGo backup');
-    if (!confirm('Restore this backup? It will REPLACE everything currently in the app (' + (j.data.invoices || []).length + ' invoices/estimates in the file).')) return;
+    if (!confirm('Restore this backup? It will REPLACE everything currently in the app – on all your synced devices (' + (j.data.invoices || []).length + ' invoices/estimates in the file).')) return;
     KEYS.forEach(k => { db[k] = j.data[k] != null ? j.data[k] : clone(DEFAULTS[k]); }); db.settings = Object.assign({}, DEFAULT_SETTINGS, db.settings, { seeded: true });
-    saveAll(); toast('Backup restored'); render();
+    normaliseLegacy(); saveAll(); toast('Backup restored'); render();
   } catch (e) { toast('Could not restore: ' + e.message); }
 }
-ACT.wipe = () => { if (!confirm('Erase ALL invoices, clients, expenses and settings from this device? Download a backup first if unsure.')) return; if (!confirm('Really erase everything?')) return; KEYS.forEach(k => localStorage.removeItem('igg_' + k)); load(); toast('All data erased'); go('dashboard'); render(); };
+ACT.wipe = () => {
+  if (!confirm('Erase ALL invoices, clients, expenses and settings? This also erases the cloud copy, so every synced device will be emptied. Download a backup first if unsure.')) return; if (!confirm('Really erase everything?')) return;
+  KEYS.forEach(k => { db[k] = clone(DEFAULTS[k]); }); db.settings.seeded = false; saveAll(); maybeSeed(); toast('All data erased'); go('dashboard'); render();
+};
 
 /* ================= Demo data ================= */
 function loadDemo() {
@@ -936,10 +1022,318 @@ VIEWS.more = function () {
   <a class="li c3" style="grid-template-columns:30px 1fr;color:inherit" href="#/import">${ico('clock')}<b>Import hours</b></a></div></div>`;
 };
 
-/* ================= init ================= */
-load(); buildShell();
-if (!location.hash) location.hash = '#/dashboard';
-render();
+/* ================= sign-in (PIN) ================= */
+const TOK_KEY = 'igg_token';
+function getTok() { try { const t = JSON.parse(localStorage.getItem(TOK_KEY)); return t && t.expires > Date.now() ? t.token : ''; } catch (e) { return ''; } }
+const setTok = t => lsSet(TOK_KEY, { token: t.token, expires: t.expires });
+const isNet = e => e instanceof TypeError;
+async function apiCall(path, opts) {
+  opts = opts || {}; const t = getTok();
+  const r = await fetch('/api/' + path, { method: opts.method || 'GET', cache: 'no-store', headers: Object.assign({}, t && opts.auth !== false ? { authorization: 'Bearer ' + t } : {}, opts.raw === undefined && opts.body !== undefined ? { 'content-type': 'application/json' } : {}), body: opts.raw !== undefined ? opts.raw : opts.body !== undefined ? JSON.stringify(opts.body) : undefined });
+  const text = await r.text(); let json = null; try { json = JSON.parse(text); } catch (e) { /* not json */ }
+  if (r.status === 401 && t && opts.auth !== false) sessionExpired();
+  return { status: r.status, ok: r.ok, json, text };
+}
+function sessionExpired() { try { localStorage.removeItem(TOK_KEY); } catch (e) { /* ignore */ } setSync('locked'); showLock('Your session ended – please enter your PIN again.'); }
+let appStarted = false;
+const lockShell = inner => `<div class="lock-card"><div class="brand big"><img src="icon.svg" alt=""><span>Invoice <b>GoGo</b></span></div>${inner}</div>`;
+async function showLock(note) {
+  document.body.classList.add('locked'); closeModal();
+  let el = $('#lock'); if (!el) { el = document.createElement('div'); el.id = 'lock'; document.body.appendChild(el); }
+  el.innerHTML = lockShell('<p class="note" style="text-align:center">Checking…</p>');
+  let st = null;
+  try { const r = await apiCall('status', { auth: false }); st = r.json; if (!r.ok || !st || st.app !== 'invoice-gogo') st = null; } catch (e) { st = null; }
+  if (!st) { el.innerHTML = lockShell(`<h2>Can't reach the server</h2><p class="note">Invoice GoGo couldn't contact its sync service. Check your connection${location.hostname === 'localhost' ? ' (and that the dev server with the API is running)' : ''}, then try again.</p><div class="btn-row"><button class="btn primary" data-act="lockRetry">Try again</button></div>`); return; }
+  if (!st.configured) { el.innerHTML = lockShell(`<h2>Server not configured</h2><p class="note">The <code>IGG_SECRET</code> environment variable is missing on the Netlify site, so sign-in is switched off. Set it (a long random string) and redeploy.</p>`); return; }
+  if (!st.pinSet) {
+    el.innerHTML = lockShell(`<h2>Create your PIN</h2><p class="note">This protects your invoices and client details in the cloud. Choose a PIN or password of <b>at least 6 characters</b> – you'll enter it on each new phone or computer.</p>
+      <form id="lockForm" data-mode="setup" autocomplete="off"><div class="fg"><label>New PIN / password</label><input type="password" id="pinNew" autocomplete="new-password" required></div>
+      <div class="fg"><label>Repeat it</label><input type="password" id="pinConfirm" autocomplete="new-password" required></div>
+      ${st.setupCodeRequired ? '<div class="fg"><label>Setup code (given to you when the site was set up)</label><input type="text" id="setupCode" autocomplete="off" required></div>' : ''}
+      <div id="lockErr" class="lock-err">${esc(note || '')}</div><button class="btn primary" type="submit" style="width:100%">Create PIN &amp; open app</button></form>
+      <p class="note" style="margin-top:.8rem">There's no “forgot PIN” email. If you ever forget it, the PIN can be reset from the Netlify dashboard (Blobs store “igg-auth”).</p>`);
+  } else {
+    el.innerHTML = lockShell(`<h2>Enter your PIN</h2><form id="lockForm" data-mode="login"><div class="fg"><input type="password" id="pinLogin" autocomplete="current-password" placeholder="PIN / password" required autofocus></div>
+      <div id="lockErr" class="lock-err">${esc(note || '')}</div><button class="btn primary" type="submit" style="width:100%">Unlock</button></form>`);
+  }
+  const f = $('#pinNew') || $('#pinLogin'); if (f) f.focus();
+}
+ACT.lockRetry = () => showLock();
+document.addEventListener('submit', async e => {
+  const f = e.target; if (f.id !== 'lockForm' && f.id !== 'pinChangeForm') return; e.preventDefault();
+  const err = $('#lockErr'), btn = $('button[type=submit]', f); const fail = m => { if (err) err.textContent = m; if (btn) btn.disabled = false; };
+  if (err) err.textContent = ''; btn.disabled = true;
+  try {
+    if (f.id === 'pinChangeForm') {
+      const cur = $('#pcCur').value, nw = $('#pcNew').value, rep2 = $('#pcRep').value;
+      if (nw.length < 6) return fail('New PIN must be at least 6 characters.'); if (nw !== rep2) return fail('The two new PINs do not match.');
+      const r = await apiCall('change-pin', { method: 'POST', body: { pin: cur, newPin: nw } });
+      if (!r.ok) return fail((r.json && r.json.error) || 'Could not change PIN'); setTok(r.json); f.reset(); btn.disabled = false; toast('PIN changed – other devices will ask for the new PIN'); return;
+    }
+    let r;
+    if (f.dataset.mode === 'setup') {
+      const pin = $('#pinNew').value; if (pin.length < 6) return fail('Choose at least 6 characters.'); if (pin !== $('#pinConfirm').value) return fail('The two PINs do not match.');
+      r = await apiCall('setup', { method: 'POST', auth: false, body: { pin, setupCode: $('#setupCode') ? $('#setupCode').value.trim() : undefined } });
+    } else r = await apiCall('login', { method: 'POST', auth: false, body: { pin: $('#pinLogin').value } });
+    if (!r.ok) return fail(r.status === 429 ? 'Too many wrong attempts. Try again in ' + Math.ceil(((r.json && r.json.retryAfter) || 900) / 60) + ' minutes.' : (r.json && r.json.error) || 'Something went wrong (HTTP ' + r.status + ')');
+    setTok(r.json); enterApp();
+  } catch (e2) { fail(isNet(e2) ? "Can't reach the server – check your connection." : String(e2.message || e2)); }
+});
+
+/* ================= cloud sync ================= */
+let syncSt = 'idle', syncMsg = '', syncing = false, syncAgain = false, syncTimer = null;
+const pendingCount = () => KEYS.reduce((n, k) => n + Object.keys(S.dirty[k] || {}).length, 0) + Object.keys(S.pendImg || {}).length;
+function setSync(st, msg) { syncSt = st; syncMsg = msg || ''; paintSync(); if (location.hash === '#/apps' || location.hash === '#/settings') { const c = $('#cloudStatus'); if (c) c.innerHTML = cloudStatusHTML(); } }
+function paintSync() {
+  const el = $('#syncInd'); if (!el) return; const n = pendingCount();
+  const m = { synced: ['Synced', 'ok', 'All changes are saved to the cloud' + (S.lastSync ? ' · last sync ' + new Date(S.lastSync).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : '')], syncing: ['Syncing…', 'busy', 'Talking to the cloud'], offline: ['Offline' + (n ? ' · ' + n + ' waiting' : ''), 'off', 'No connection – changes are saved on this device and will upload when you are back online'], error: ['Sync problem', 'err', syncMsg || 'Last sync failed – tap to retry'], locked: ['Locked', 'off', 'Sign in to sync'], idle: [n ? n + ' waiting' : 'Ready', 'off', 'Tap to sync'] }[syncSt];
+  el.className = 'sync-ind ' + m[1]; el.innerHTML = `<i class="dot"></i><span>${esc(m[0])}</span>`; el.title = m[2]; el.setAttribute('aria-label', 'Cloud sync: ' + m[0]);
+}
+function scheduleSync(delay) { paintSync(); if (!getTok() || !appStarted) return; clearTimeout(syncTimer); syncTimer = setTimeout(syncNow, delay || 1500); }
+ACT.syncNow = () => { syncNow(true); };
+const hasLocalData = () => db.invoices.length || db.expenses.length || db.projects.length || db.clients.some(c => c.id !== SEED_CLIENT) || db.items.some(i => i.id !== SEED_ITEM) || !!(db.settings.bankName || db.settings.email || db.settings.phone || db.settings.logo);
+function softRender() {
+  if ($('#modalBg') || ed) return; const a = document.activeElement;
+  if (a && /INPUT|TEXTAREA|SELECT/.test(a.tagName) && $('#page').contains(a)) return;
+  const y = window.scrollY; render(); window.scrollTo(0, y);
+}
+async function uploadPendingImages() {
+  for (const ref of Object.keys(S.pendImg)) {
+    const data = IMG[ref] || await idbGet(ref); if (!data) { delete S.pendImg[ref]; continue; }
+    const r = await apiCall(ref.replace(':', '/'), { method: 'PUT', raw: data });
+    if (r.ok || r.status === 400 || r.status === 413) { if (!r.ok) console.warn('image rejected by server', ref, r.status); delete S.pendImg[ref]; } else if (r.status !== 401) throw new Error((r.json && r.json.error) || 'Image upload failed (HTTP ' + r.status + ')');
+  }
+  writeSync();
+}
+/** merge the server's full state into local data. Records changed locally since they were sent stay local (and stay queued). */
+function applyRemote(state, sent) {
+  let changed = false; sent = sent || {};
+  for (const k of KEYS) {
+    for (const r of (state.collections[k] || [])) {
+      const id = r.id; const cur = snap(k)[id]; const lts = getTs(k, id, cur);
+      if (S.dirty[k][id]) { const was = sent[k] && sent[k][id]; if (!was || was !== (cur !== undefined ? lts : S.tombs[k][id])) continue; } // changed again since it was sent: keep local, stays queued
+      delete S.dirty[k][id];
+      if (r.deleted) {
+        if (k === 'settings') continue;
+        if (k === 'imported') { if (id in db.imported) { delete db.imported[id]; changed = true; } delete S.ts.imported[id]; }
+        else { const i = db[k].findIndex(x => x.id === id); if (i >= 0) { db[k].splice(i, 1); changed = true; } }
+        delete S.base[k][id]; S.tombs[k][id] = r.updatedAt; continue;
+      }
+      delete S.tombs[k][id];
+      if (k === 'settings') {
+        const { id: _i, updatedAt, ...rest } = r; const next = Object.assign({}, DEFAULT_SETTINGS, rest);
+        next.nextInvoice = Math.max(next.nextInvoice, db.settings.nextInvoice || 1); next.nextEstimate = Math.max(next.nextEstimate, db.settings.nextEstimate || 1);
+        const h = hashOf(k, next); if (S.base.settings.settings !== h || hashOf(k, db.settings) !== h) changed = true; db.settings = next; S.ts.settings = updatedAt; S.base.settings.settings = h;
+      } else if (k === 'imported') {
+        if (db.imported[id] !== r.invoiceId) changed = true; db.imported[id] = r.invoiceId; S.ts.imported[id] = r.updatedAt; S.base.imported[id] = hashOf(k, { invoiceId: r.invoiceId });
+      } else {
+        const h = hashOf(k, r); const i = db[k].findIndex(x => x.id === id);
+        if (i < 0) { db[k].push(r); changed = true; } else { if (S.base[k][id] !== h || hashOf(k, db[k][i]) !== h) changed = true; db[k][i] = r; }
+        S.base[k][id] = h;
+      }
+    }
+  }
+  KEYS.forEach(writeKey); writeSync(); return changed;
+}
+async function syncNow(manual) {
+  if (!getTok() || !appStarted) return;
+  if (syncing) { syncAgain = true; return; }
+  if (!S.cloudInit) return initialSync();
+  if (navigator.onLine === false) { setSync('offline'); return; }
+  syncing = true; setSync('syncing');
+  try {
+    await uploadPendingImages();
+    const sent = {}, changes = {};
+    for (const k of KEYS) { const ids = Object.keys(S.dirty[k]); if (!ids.length) continue; changes[k] = []; sent[k] = {}; ids.forEach(id => { const w = toWire(k, id); if (w) { changes[k].push(w); sent[k][id] = w.updatedAt; } else delete S.dirty[k][id]; }); }
+    const r = await apiCall('sync', { method: 'POST', body: { changes } });
+    if (r.status === 401) return;
+    if (!r.ok) throw new Error((r.json && r.json.error) || 'Server said HTTP ' + r.status);
+    const changed = applyRemote(r.json, sent); S.lastSync = Date.now(); writeSync(); setSync('synced');
+    if (changed) { softRender(); }
+  } catch (e) { if (isNet(e)) setSync('offline'); else { console.warn('sync failed', e); setSync('error', 'Sync failed: ' + (e.message || e)); } }
+  finally { syncing = false; if (syncAgain) { syncAgain = false; scheduleSync(300); } }
+}
+async function initialSync() {
+  if (syncing) return; syncing = true; setSync('syncing');
+  try {
+    const r = await apiCall('data'); if (r.status === 401) return; if (!r.ok) throw new Error((r.json && r.json.error) || 'Server said HTTP ' + r.status);
+    const cloud = r.json; const cloudHas = KEYS.some(k => k !== 'settings' && (cloud.collections[k] || []).some(x => !x.deleted));
+    const finish = () => { S.cloudInit = true; writeSync(); syncing = false; maybeSeed(); render(); syncNow(); };
+    if (!hasLocalData()) { const cinit = S.cloudInit; resetSyncMeta(); S.cloudInit = cinit; applyRemote(cloud, {}); finish(); return; }
+    const n = db.invoices.length, nc = db.clients.length, ne = db.expenses.length;
+    const mine = `<b>${n}</b> invoice${n === 1 ? '' : 's'}/estimate${n === 1 ? '' : 's'}, <b>${nc}</b> client${nc === 1 ? '' : 's'} and <b>${ne}</b> expense${ne === 1 ? '' : 's'}`;
+    syncing = false;
+    if (!cloudHas) modal('Upload this device\'s data to the cloud', `<p style="margin-top:0">This browser already has ${mine} saved on it. Upload them so your phone and Mac share the same data?</p><p class="note">Your cloud store is empty, so nothing will be overwritten.</p>`,
+      [{ label: 'Upload to the cloud', cls: 'primary', fn: () => { KEYS.forEach(k => { Object.keys(snap(k)).forEach(id => { S.dirty[k][id] = 1; }); }); S.cloudInit = true; writeSync(); setTimeout(syncNow, 50); } },
+        { label: 'No – discard this device\'s data', cls: 'danger', fn: () => { if (!confirm('Discard everything saved on this device and start from the (empty) cloud?')) return false; resetSyncMeta(); KEYS.forEach(k => { db[k] = clone(DEFAULTS[k]); }); KEYS.forEach(writeKey); applyRemote(cloud, {}); finish(); } }], { sticky: true });
+    else modal('Combine this device with the cloud', `<p style="margin-top:0">This browser has ${mine}, and the cloud already holds data from another device.</p><p class="note"><b>Merge</b> keeps everything from both (if the same record exists in both, the most recently edited one wins). <b>Use cloud only</b> replaces what's on this device.</p>`,
+      [{ label: 'Merge both', cls: 'primary', fn: () => { KEYS.forEach(k => { Object.keys(snap(k)).forEach(id => { S.dirty[k][id] = 1; }); }); S.cloudInit = true; writeSync(); setTimeout(syncNow, 50); } },
+        { label: 'Use cloud only', cls: 'danger', fn: () => { if (!confirm('Replace everything on this device with the cloud copy?')) return false; resetSyncMeta(); KEYS.forEach(k => { db[k] = clone(DEFAULTS[k]); }); applyRemote(cloud, {}); finish(); } }], { sticky: true });
+    setSync('idle');
+  } catch (e) { syncing = false; if (isNet(e)) setSync('offline'); else setSync('error', 'Sync failed: ' + (e.message || e)); }
+}
+function startBackgroundSync() {
+  window.addEventListener('online', () => syncNow()); window.addEventListener('offline', () => setSync('offline'));
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') syncNow(); });
+  setInterval(() => { if (document.visibilityState === 'visible') syncNow(); }, 45000);
+}
+function cloudStatusHTML() {
+  const n = pendingCount(), lab = { synced: 'Synced', syncing: 'Syncing…', offline: 'Offline', error: 'Sync problem', locked: 'Locked', idle: 'Ready' }[syncSt];
+  return `<span class="badge ${syncSt === 'synced' ? 'b-paid' : syncSt === 'error' ? 'b-overdue' : syncSt === 'syncing' ? 'b-sent' : 'b-draft'}">${lab}</span> ${S.lastSync ? 'Last sync ' + new Date(S.lastSync).toLocaleString('en-GB', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : 'Not synced yet'}${n ? ` · <b>${n}</b> change${n === 1 ? '' : 's'} waiting` : ''}${syncSt === 'error' && syncMsg ? `<div class="note" style="color:var(--danger)">${esc(syncMsg)}</div>` : ''}`;
+}
+
+/* ================= PDF (text-based, drawn with jsPDF) ================= */
+function loadScript(src) { return new Promise((res, rej) => { if ($(`script[data-src="${src}"]`)) return res(); const el = document.createElement('script'); el.src = src; el.dataset.src = src; el.onload = res; el.onerror = () => { el.remove(); rej(new Error('Could not load ' + src)); }; document.head.appendChild(el); }); }
+const safeName = s => String(s || '').replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim() || 'Untitled';
+const pdfName = d => safeName(d.number + ' - ' + clientName(d.clientId)) + '.pdf';
+async function makePdf(d) {
+  await loadScript('vendor/jspdf.umd.min.js'); await loadScript('pdf.js');
+  const logo = db.settings.logo ? ((await loadImg(db.settings.logo)) || '') : '';
+  const pdf = window.IGGPdf.build({ L, doc: d, settings: db.settings, client: clientOf(d.clientId) || {}, project: projectOf(d.projectId), status: status(d), logo, jsPDF: window.jspdf.jsPDF });
+  const bytes = new Uint8Array(pdf.output('arraybuffer')); let bin = ''; for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return { bytes, binary: bin, blob: new Blob([bytes], { type: 'application/pdf' }), filename: pdfName(d) };
+}
+ACT.pdf = async el => {
+  const d = docOf(el.dataset.id);
+  try { toast('Building PDF…'); const p = await makePdf(d); const url = URL.createObjectURL(p.blob); const a = document.createElement('a'); a.href = url; a.download = p.filename; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 5000); toast('PDF downloaded'); }
+  catch (e) { console.warn(e); toast('Could not build the PDF: ' + e.message); }
+};
+
+/* ================= Google: Gmail send + Drive save (Google Identity Services token model) ================= */
+const GOOGLE_SCOPES = 'https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/drive.file';
+let gTok = null, gClient = null, gClientId = '', gisPromise = null;
+const hasGoogleId = () => !!(db.settings.googleClientId || '').trim();
+const hasScope = (tok, name) => !!tok && (tok.scope || '').includes('/auth/' + name);
+function loadGis() { if (window.google && window.google.accounts) return Promise.resolve(); return gisPromise || (gisPromise = loadScript('https://accounts.google.com/gsi/client').catch(e => { gisPromise = null; throw e; })); }
+/** MUST be called synchronously from a click handler (before any await) or the browser blocks the pop-up. */
+function googleToken() {
+  return new Promise((resolve, reject) => {
+    if (gTok && gTok.exp > Date.now() + 60000) return resolve(gTok);
+    const cid = (db.settings.googleClientId || '').trim(); if (!cid) return reject(new Error('No Google Client ID is set (Settings → Integrations).'));
+    if (!(window.google && window.google.accounts && window.google.accounts.oauth2)) { loadGis().catch(() => {}); return reject(new Error('Google sign-in is still loading (or is blocked by an ad-blocker). Check your connection and try again in a moment.')); }
+    if (!gClient || gClientId !== cid) { gClientId = cid; gClient = window.google.accounts.oauth2.initTokenClient({ client_id: cid, scope: GOOGLE_SCOPES, callback: () => {} }); }
+    gClient.callback = resp => {
+      if (!resp || resp.error) return reject(new Error(resp && resp.error === 'access_denied' ? 'Google access was declined.' : 'Google sign-in failed: ' + ((resp && (resp.error_description || resp.error)) || 'unknown error')));
+      gTok = { token: resp.access_token, exp: Date.now() + (Number(resp.expires_in) || 3600) * 1000, scope: resp.scope || '' }; resolve(gTok);
+    };
+    gClient.error_callback = e => reject(new Error(e && e.type === 'popup_closed' ? 'The Google sign-in window was closed before it finished.' : e && e.type === 'popup_failed_to_open' ? 'Your browser blocked the Google sign-in pop-up – allow pop-ups for this site and try again.' : 'Google sign-in failed' + (e && e.message ? ': ' + e.message : '.')));
+    try { gClient.requestAccessToken(); } catch (e) { reject(e); }
+  });
+}
+async function gErr(r, who) {
+  let m = ''; try { const j = await r.json(); m = (j.error && (j.error.message || (typeof j.error === 'string' ? j.error : ''))) || ''; } catch (e) { /* no body */ }
+  if (r.status === 401) gTok = null;
+  const hint = /has not been used|is disabled|accessNotConfigured|SERVICE_DISABLED/i.test(m) ? ' – enable the ' + who + ' API in your Google Cloud project.' : r.status === 403 ? ' – check the API is enabled and your Gmail address is listed as a test user.' : r.status === 401 ? ' – sign in to Google again.' : '';
+  return `${who} said ${r.status}${m ? ': ' + m : ''}${hint}`;
+}
+const gfetch = async (url, o, tok, who) => { const r = await fetch(url, Object.assign({}, o, { headers: Object.assign({}, (o && o.headers) || {}, { authorization: 'Bearer ' + tok.token }) })); if (!r.ok) throw new Error(await gErr(r, who)); return r; };
+const qe = s => String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+const folderCache = {};
+async function driveFolder(name, parent, tok) {
+  const key = (parent || 'root') + '/' + name; if (folderCache[key]) return folderCache[key];
+  const q = `name = '${qe(name)}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false and '${parent || 'root'}' in parents`;
+  const found = await (await gfetch('https://www.googleapis.com/drive/v3/files?pageSize=5&fields=files(id,name)&q=' + encodeURIComponent(q), {}, tok, 'Drive')).json();
+  if (found.files && found.files[0]) return (folderCache[key] = found.files[0].id);
+  const made = await (await gfetch('https://www.googleapis.com/drive/v3/files?fields=id', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, mimeType: 'application/vnd.google-apps.folder', parents: [parent || 'root'] }) }, tok, 'Drive')).json();
+  return (folderCache[key] = made.id);
+}
+async function driveUpload(method, url, meta, blob, tok) {
+  const b = 'iggb' + Math.random().toString(36).slice(2);
+  const body = new Blob([`--${b}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n--${b}\r\nContent-Type: application/pdf\r\n\r\n`, blob, `\r\n--${b}--`]);
+  return (await gfetch(url, { method, headers: { 'content-type': 'multipart/related; boundary=' + b }, body }, tok, 'Drive')).json();
+}
+/** Saves <Drive root>/<Client>/<number - client>.pdf. Re-saving the same invoice updates the same file (Drive keeps earlier versions in its version history). */
+async function driveSave(d0, tok) {
+  let d = docOf(d0.id) || d0;
+  if (!hasScope(tok, 'drive.file')) throw new Error('Google Drive permission was not granted – tick the Drive box on the Google consent screen.');
+  const pdf = await makePdf(d); const rootName = safeName(db.settings.driveRoot || 'Invoice GoGo'); const cName = safeName(clientName(d.clientId));
+  let root, cf; try { root = await driveFolder(rootName, null, tok); cf = await driveFolder(cName, root, tok); } catch (e) { Object.keys(folderCache).forEach(k => delete folderCache[k]); throw e; }
+  const meta = { name: pdf.filename }; let file = null;
+  if (d.driveFileId) {
+    const mv = d.driveFolderId && d.driveFolderId !== cf ? `&addParents=${cf}&removeParents=${d.driveFolderId}` : '';
+    try { file = await driveUpload('PATCH', `https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(d.driveFileId)}?uploadType=multipart&fields=id,name,webViewLink${mv}`, meta, pdf.blob, tok); }
+    catch (e) { if (!/Drive said 404/.test(e.message)) throw e; }
+  }
+  if (!file) file = await driveUpload('POST', 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink', Object.assign({ parents: [cf], mimeType: 'application/pdf' }, meta), pdf.blob, tok);
+  d = docOf(d0.id) || d; d.driveFileId = file.id; d.driveFolderId = cf; d.driveLink = file.webViewLink || ''; d.driveSavedAt = new Date().toISOString(); d.drivePath = rootName + '/' + cName + '/' + (file.name || pdf.filename);
+  save('invoices'); return file;
+}
+const SETUP_STEPS = () => `<ol class="steps"><li>Go to <b>console.cloud.google.com</b> → project picker → <b>New project</b> (name it “Invoice GoGo”).</li>
+  <li><b>APIs &amp; Services → Library</b>: search and <b>Enable</b> both <b>Gmail API</b> and <b>Google Drive API</b>.</li>
+  <li><b>APIs &amp; Services → OAuth consent screen</b> (Google Auth Platform): User type <b>External</b> → app name “Invoice GoGo”, your Gmail as support/developer email → Save. Leave publishing status on <b>Testing</b>. Under <b>Audience / Test users</b> click <b>Add users</b> and add <b>your own Gmail address</b>.</li>
+  <li><b>Credentials → Create credentials → OAuth client ID</b> → Application type <b>Web application</b>. Under <b>Authorised JavaScript origins</b> add <code>${esc(location.origin)}</code> (no path, no trailing slash). Leave redirect URIs empty. Create.</li>
+  <li>Copy the <b>Client ID</b> (ends in <code>.apps.googleusercontent.com</code>) into <b>Settings → Integrations → Google Client ID</b>, then press <b>Connect Google</b>.</li>
+  <li>On the Google screen choose your Gmail account. It will say “Google hasn't verified this app” – that's normal for your own test app: <b>Advanced → Go to Invoice GoGo</b> and tick both permissions (send email; create files in Drive).</li></ol>
+  <p class="note">The Client ID isn't a secret. In “Testing” mode Google asks you to re-approve about every 7 days; that's the only downside of skipping app verification.</p>`;
+function googleSetupHelp(why) {
+  modal('Set up Google (one-time, ~5 minutes)', `${why ? `<p style="margin-top:0"><b>${esc(why)}</b></p>` : ''}<p class="note" style="margin-top:0">To email invoices from your own Gmail and save PDFs to your Drive, Invoice GoGo needs a Google “Client ID” that only you own. Nothing is sent to anyone else.</p>${SETUP_STEPS()}`,
+    [{ label: 'Close' }, { label: 'Open Settings → Integrations', cls: 'primary', fn: () => { go('settings'); setTimeout(() => { const e = $('#integrations'); if (e) e.scrollIntoView(); }, 200); } }]);
+}
+function mailVars(d) {
+  const c = clientOf(d.clientId) || {}, isEst = d.type === 'estimate';
+  return { kind: isEst ? 'Estimate' : 'Invoice', kind_lc: isEst ? 'estimate' : 'invoice', number: d.number, total: gbp(docTotal(d)), due: dmy(d.dueDate), duelabel: isEst ? 'This estimate is valid until' : 'Payment is due by', client: c.name || '', contact: c.contact || 'there', business: db.settings.name || '', project: (projectOf(d.projectId) || {}).name || '' };
+}
+ACT.emailDoc = el => {
+  const d = docOf(el.dataset.id); if (!hasGoogleId()) return googleSetupHelp('Add your Google Client ID first to email invoices.');
+  loadGis().catch(() => {}); const c = clientOf(d.clientId) || {}, v = mailVars(d), s = db.settings;
+  const bg = modal('Email ' + d.number + ' from your Gmail', `
+    <div class="fg"><label>To</label><input type="email" id="mTo" value="${esc(c.email || '')}" placeholder="client@example.com"></div>
+    <div class="fg"><label>Subject</label><input type="text" id="mSubj" value="${esc(L.fillTemplate(s.mailSubject, v))}"></div>
+    <div class="fg"><label>Message</label><textarea id="mBody" rows="8">${esc(L.fillTemplate(s.mailBody, v))}</textarea></div>
+    ${s.email ? `<label class="chk" style="margin-bottom:.6rem"><input type="checkbox" id="mBcc" ${s.mailBccSelf ? 'checked' : ''}> Send me a copy (Bcc ${esc(s.email)})</label>` : ''}
+    <div class="mail-att" id="mAtt"><span>📎 ${esc(pdfName(d))}</span> <span class="note" id="mAttInfo">building PDF…</span> <button class="btn small" id="mPrev" disabled>Preview PDF</button></div>
+    <div class="note" style="margin-top:.6rem">Pressing <b>Send</b> emails this from your own Gmail account${c.email ? '' : ' (add the client\'s email address first)'} and marks ${esc(d.number)} as <b>Sent</b>. Google may ask you to approve access first.</div>
+    <div id="mErr" class="lock-err"></div>`,
+    [{ label: 'Cancel' }, { label: 'Send email', cls: 'primary', fn: m => {
+      const to = $('#mTo', m).value.trim(), subject = $('#mSubj', m).value.trim(), body = $('#mBody', m).value, bcc = $('#mBcc', m) && $('#mBcc', m).checked ? s.email : '';
+      const err = t => { $('#mErr', m).textContent = t; };
+      if (!/^[^@\s,;]+@[^@\s,;]+\.[^@\s,;]+$/.test(to)) { err('Enter one valid recipient email address.'); return false; }
+      if (!subject) { err('Add a subject.'); return false; }
+      const tokP = googleToken(); // synchronous inside the click, so the browser allows the Google pop-up
+      const btn = $('[data-mb="1"]', m); btn.disabled = true; btn.textContent = 'Sending…'; err('');
+      doSend(d, { to, subject, body, bcc }, tokP, m).catch(e => { err(String(e.message || e)); btn.disabled = false; btn.textContent = 'Send email'; });
+      return false;
+    } }]);
+  const pdfP = makePdf(d); bg._pdf = pdfP;
+  pdfP.then(p => { $('#mAttInfo', bg).textContent = '(' + Math.max(1, Math.round(p.bytes.length / 1024)) + ' KB, text PDF)'; const b = $('#mPrev', bg); b.disabled = false; b.onclick = () => window.open(URL.createObjectURL(p.blob), '_blank'); }).catch(e => { $('#mAttInfo', bg).textContent = 'PDF failed: ' + e.message; });
+};
+async function doSend(d0, mail, tokP, m) {
+  const tok = await tokP; let d = docOf(d0.id) || d0; if (!hasScope(tok, 'gmail.send')) throw new Error('Gmail permission was not granted – approve “Send email on your behalf” on the Google screen and try again.');
+  const pdf = await m._pdf; const raw = L.mimeToRaw(L.buildMime({ to: mail.to, bcc: mail.bcc, subject: mail.subject, body: mail.body, attachment: { filename: pdf.filename, mime: 'application/pdf', binary: pdf.binary } }));
+  const r = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', { method: 'POST', headers: { authorization: 'Bearer ' + tok.token, 'content-type': 'application/json' }, body: JSON.stringify({ raw }) });
+  if (!r.ok) throw new Error(await gErr(r, 'Gmail'));
+  const j = await r.json(); if (!j || !j.id) throw new Error('Gmail did not confirm the message was sent. Check your Sent folder before trying again.');
+  d = docOf(d0.id) || d; // a background sync may have replaced the record object while the dialog was open
+  if (d.status === 'draft' || !d.status) d.status = 'sent'; d.sentAt = L.todayYMD(); d.sentTo = mail.to; d.gmailId = j.id; save('invoices'); closeModal();
+  let msg = 'Email sent to ' + mail.to + ' – ' + d.number + ' marked as Sent';
+  if (db.settings.driveOnSend) { try { await driveSave(d, tok); msg += ' and saved to Drive'; } catch (e) { msg += ', but the Drive save failed: ' + e.message; } }
+  toast(msg); render();
+}
+ACT.driveDoc = el => {
+  const d = docOf(el.dataset.id); if (!hasGoogleId()) return googleSetupHelp('Add your Google Client ID first to save to Drive.');
+  const tokP = googleToken(); toast('Saving to Google Drive…');
+  tokP.then(tok => driveSave(d, tok)).then(f => { render(); modal('Saved to Google Drive', `<p style="margin-top:0">✓ <b>${esc(d.drivePath)}</b></p>${f.webViewLink ? `<p><a href="${esc(f.webViewLink)}" target="_blank" rel="noopener">Open in Drive</a></p>` : ''}<p class="note">Saving again later updates this same file (Drive keeps the old versions).</p>`, [{ label: 'Done', cls: 'primary' }]); })
+    .catch(e => toast('Drive save failed: ' + (e.message || e)));
+};
+ACT.googleConnect = () => {
+  if (!hasGoogleId()) return googleSetupHelp('Paste your Google Client ID first.');
+  const out = $('#gStatus'); const tokP = googleToken(); out.textContent = 'Waiting for Google…';
+  tokP.then(tok => { out.innerHTML = `<span class="badge b-paid">Connected</span> Gmail send: ${hasScope(tok, 'gmail.send') ? '✓' : '✗ not granted'} · Drive files: ${hasScope(tok, 'drive.file') ? '✓' : '✗ not granted'} <span class="note">(this browser session)</span>`; })
+    .catch(e => { out.innerHTML = `<span class="badge b-overdue">Not connected</span> ${esc(e.message)}`; });
+};
+ACT.googleHelp = () => googleSetupHelp();
+ACT.lockDevice = () => { if (!confirm('Lock this device? You\'ll need your PIN to open the app again. (Anything not yet synced stays on this device.)')) return; try { localStorage.removeItem(TOK_KEY); } catch (e) { /* ignore */ } setSync('locked'); showLock(); };
+
+/* ================= boot ================= */
+function enterApp() {
+  document.body.classList.remove('locked'); const l = $('#lock'); if (l) l.remove();
+  if (!appStarted) { appStarted = true; buildShell(); startBackgroundSync(); if (!location.hash) location.hash = '#/dashboard'; }
+  if (db.settings.logo) loadImg(db.settings.logo);
+  if (hasGoogleId()) loadGis().catch(() => {});
+  render(); paintSync(); syncNow();
+}
+function boot() { load(); if (getTok()) enterApp(); else showLock(); }
+boot();
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('sw.js').catch(() => {});
-window.__igg = { db: () => db, L, render, state: () => ({ ed, imp }) };
+window.__igg = { db: () => db, S: () => S, L, render, syncNow, state: () => ({ ed, imp, syncSt }), IMG, save, saveAll, makePdf, newDoc, uid, saveImg, loadImg, docOf };
 })();

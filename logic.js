@@ -201,7 +201,40 @@
   }
   function taxYearRange(startYear) { return { from: startYear + '-04-06', to: (startYear + 1) + '-04-05' }; }
 
-  return { toPence, fromPence, round2, gbp, lineAmount, totals, ymd, parseYMD, todayYMD, addDays, dmy, hm, monthKey, monthLabel, daysBetween,
+
+  /* ---------- email (MIME) ---------- */
+  const b64urlFromBinary = bin => { const b = typeof btoa === 'function' ? btoa(bin) : Buffer.from(bin, 'binary').toString('base64'); return b.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); };
+  const utf8Bin = str => { if (typeof TextEncoder !== 'undefined') { const u = new TextEncoder().encode(str); let s = ''; for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]); return s; } return Buffer.from(str, 'utf8').toString('binary'); };
+  const b64 = bin => (typeof btoa === 'function' ? btoa(bin) : Buffer.from(bin, 'binary').toString('base64'));
+  const wrap76 = s => (s.match(/.{1,76}/g) || ['']).join('\r\n');
+  const encWord = s => /^[\x20-\x7e]*$/.test(s) ? s : '=?UTF-8?B?' + b64(utf8Bin(s)) + '?=';
+  const encSubject = s => { // RFC 2047, split into <=45-byte chunks on character boundaries so lines stay short
+    if (/^[\x20-\x7e]*$/.test(s)) return s; const chars = Array.from(s); const parts = []; let cur = '';
+    chars.forEach(ch => { if (utf8Bin(cur + ch).length > 45) { parts.push(cur); cur = ''; } cur += ch; }); if (cur) parts.push(cur);
+    return parts.map(p => '=?UTF-8?B?' + b64(utf8Bin(p)) + '?=').join('\r\n ');
+  };
+  const cleanHeader = s => String(s || '').replace(/[\r\n]+/g, ' ').trim();
+  /** Builds a multipart/mixed RFC 5322 message (CRLF). attachment: {filename, mime, binary} where binary is a binary string. Returns the RAW message string. */
+  function buildMime(o) {
+    const boundary = o.boundary || ('igg_' + Math.random().toString(36).slice(2) + Date.now().toString(36));
+    const h = [];
+    if (o.from) h.push('From: ' + cleanHeader(o.from));
+    h.push('To: ' + cleanHeader(o.to)); if (o.bcc) h.push('Bcc: ' + cleanHeader(o.bcc));
+    h.push('Subject: ' + encSubject(cleanHeader(o.subject))); h.push('MIME-Version: 1.0');
+    const body = String(o.body || '').replace(/\r?\n/g, '\r\n');
+    const parts = ['--' + boundary, 'Content-Type: text/plain; charset="UTF-8"', 'Content-Transfer-Encoding: base64', '', wrap76(b64(utf8Bin(body)))];
+    if (o.attachment) {
+      const fn = cleanHeader(o.attachment.filename).replace(/"/g, ''); const isAscii = /^[\x20-\x7e]*$/.test(fn);
+      const nm = isAscii ? 'name="' + fn + '"' : "name*=UTF-8''" + encodeURIComponent(fn), fnp = isAscii ? 'filename="' + fn + '"' : "filename*=UTF-8''" + encodeURIComponent(fn);
+      parts.push('--' + boundary, 'Content-Type: ' + (o.attachment.mime || 'application/pdf') + '; ' + nm, 'Content-Disposition: attachment; ' + fnp, 'Content-Transfer-Encoding: base64', '', wrap76(b64(o.attachment.binary)));
+    }
+    parts.push('--' + boundary + '--', '');
+    return h.join('\r\n') + '\r\nContent-Type: multipart/mixed; boundary="' + boundary + '"\r\n\r\n' + parts.join('\r\n');
+  }
+  const mimeToRaw = msg => b64urlFromBinary(utf8Bin(msg)); // all-ASCII already, but be safe
+  function fillTemplate(tpl, vars) { return String(tpl || '').replace(/\{(\w+)\}/g, (m, k) => (vars[k] != null ? vars[k] : m)); }
+
+  return { buildMime, mimeToRaw, fillTemplate, encSubject, b64urlFromBinary, toPence, fromPence, round2, gbp, lineAmount, totals, ymd, parseYMD, todayYMD, addDays, dmy, hm, monthKey, monthLabel, daysBetween,
     effStatus, nextNumber, sessionKey, normaliseSession, parseCSVText, parseTime, parseTimesheetCSV, parseTimesheetFile,
     weekStart, rangeFor, sessionLine, taxYearOf, taxYearRange, p2 };
 });
