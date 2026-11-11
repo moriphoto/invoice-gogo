@@ -74,4 +74,25 @@ t('session -> invoice line text', () => {
   assert.strictEqual(l.desc, 'Content work – 21/10/2026 (09:30–17:00)'); assert.strictEqual(l.qty, 7.5); assert.strictEqual(l.rate, 22);
 });
 t('bad files rejected', () => { assert.throws(() => L.parseTimesheetFile('{"foo":1}')); assert.throws(() => L.parseTimesheetFile('a,b\n1,2')); assert.throws(() => L.parseTimesheetFile('{bad')); });
+
+t('MIME: multipart message parses with Python email; subject/body/attachment survive; header injection blocked', () => {
+  const bin = Buffer.alloc(5000); for (let i = 0; i < bin.length; i++) bin[i] = (i * 7 + 13) % 256;
+  const msg = L.buildMime({ to: 'client@example.com', bcc: 'me@example.com', subject: 'Invoice INV-0001 – £2,475.00 from James Moriarty ✓\r\nBcc: evil@example.com', body: 'Hi Tamsin,\nPlease find the invoice (£2,475.00) attached.\n\nThanks – James', attachment: { filename: 'INV-0001 – The Sewing Studio.pdf', mime: 'application/pdf', binary: bin.toString('binary') } });
+  assert(!/\r\nBcc: evil/.test(msg)); assert(/\r\n/.test(msg) && !/[^\r]\n/.test(msg), 'CRLF only'); assert(msg.split('\r\n').every(l => l.length <= 998));
+  fs.writeFileSync('/tmp/igg-test.eml', msg); fs.writeFileSync('/tmp/igg-test.bin', bin);
+  const out = require('child_process').execSync(`python3 - <<'PY'
+import email, email.policy, json
+m = email.message_from_bytes(open('/tmp/igg-test.eml','rb').read(), policy=email.policy.default)
+body = m.get_body(preferencelist=('plain',)).get_content()
+att = [p for p in m.iter_attachments()][0]
+print(json.dumps({'to': m['To'], 'bcc': m['Bcc'], 'subject': m['Subject'], 'body': body, 'fn': att.get_filename(), 'ct': att.get_content_type(), 'ok': att.get_content() == open('/tmp/igg-test.bin','rb').read(), 'ctype': m.get_content_type()}))
+PY`).toString(); const r = JSON.parse(out);
+  assert.strictEqual(r.ctype, 'multipart/mixed'); assert.strictEqual(r.to, 'client@example.com'); assert.strictEqual(r.bcc, 'me@example.com');
+  assert.strictEqual(r.subject, 'Invoice INV-0001 – £2,475.00 from James Moriarty ✓ Bcc: evil@example.com'); assert(r.body.startsWith('Hi Tamsin,\r\nPlease find') || r.body.startsWith('Hi Tamsin,\nPlease find'));
+  assert(r.body.includes('£2,475.00') && r.body.includes('Thanks – James')); assert.strictEqual(r.fn, 'INV-0001 – The Sewing Studio.pdf'); assert.strictEqual(r.ct, 'application/pdf'); assert.strictEqual(r.ok, true);
+});
+t('MIME raw is base64url without padding; templates fill', () => {
+  const raw = L.mimeToRaw(L.buildMime({ to: 'a@b.co', subject: 'x', body: 'y' })); assert(/^[A-Za-z0-9_-]+$/.test(raw));
+  assert.strictEqual(L.fillTemplate('Invoice {number} for {total} – {nope}', { number: 'INV-0001', total: '£5.00' }), 'Invoice INV-0001 for £5.00 – {nope}');
+});
 console.log(n + ' tests passed');
