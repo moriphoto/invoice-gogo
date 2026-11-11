@@ -1,10 +1,12 @@
-// End-to-end tests (puppeteer-core + system Chrome). Run: NODE_PATH=/workspace/tools/node_modules TZ=Europe/London node tests/e2e.js
+// End-to-end tests (puppeteer-core + system Chrome) against the local dev server (static app + the real API handler on an in-memory blob store).
+// Run: NODE_PATH=<dir with puppeteer-core> TZ=Europe/London node tests/e2e.js
 const puppeteer = require('puppeteer-core'); const fs = require('fs'); const path = require('path'); const assert = require('assert');
-const URL = process.env.URL || 'http://localhost:8765/'; const SHOTS = path.join(__dirname, '..', 'screenshots'); const SAMPLES = path.join(__dirname, '..', 'samples');
+const TEST_PIN = 'e2e-test-pin-1'; const SHOTS = path.join(__dirname, '..', 'screenshots'); const SAMPLES = path.join(__dirname, '..', 'samples');
 fs.mkdirSync(SHOTS, { recursive: true });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let pass = 0; const t = async (name, fn) => { try { await fn(); pass++; console.log('ok  -', name); } catch (e) { process.exitCode = 1; console.error('FAIL -', name, '\n  ', e.message.split('\n').slice(0, 4).join('\n   ')); } };
 (async () => {
+  const { startDevServer } = await import('../tools/dev-server.mjs'); const srv1 = await startDevServer({ port: 8765 }); const URL = 'http://localhost:8765/';
   const b = await puppeteer.launch({ executablePath: '/usr/bin/google-chrome', args: ['--no-sandbox', '--lang=en-GB'], defaultViewport: { width: 1280, height: 800 } });
   const pg = await b.newPage(); const errs = []; await pg.setExtraHTTPHeaders({ 'Accept-Language': 'en-GB' });
   pg.on('pageerror', e => errs.push(e.message)); pg.on('console', m => { if (m.type() === 'error' && !/net::ERR|Failed to load resource/.test(m.text())) errs.push(m.text()); });
@@ -18,7 +20,8 @@ let pass = 0; const t = async (name, fn) => { try { await fn(); pass++; console.
   const db = () => pg.evaluate(() => { const o = {}; ['clients', 'invoices', 'items', 'expenses', 'projects', 'settings', 'imported'].forEach(k => o[k] = JSON.parse(localStorage.getItem('igg_' + k))); return o; });
   const shot = async (n, w, h, scroll) => { await pg.evaluate(() => { const x = document.getElementById('toast'); if (x) x.remove(); }); if (w) await pg.setViewport({ width: w, height: h, deviceScaleFactor: w < 500 ? 2 : 1, isMobile: w < 500, hasTouch: w < 500 }); await sleep(250); if (scroll) await pg.evaluate(y => window.scrollTo(0, y), scroll); await sleep(100); await pg.screenshot({ path: path.join(SHOTS, n + '.png') }); };
 
-  await pg.goto(URL); await pg.evaluate(() => localStorage.clear()); await pg.reload(); await sleep(300);
+  const unlock = async () => { await pg.waitForSelector('#lock #lockForm', { timeout: 8000 }); if (await pg.$('#pinNew')) { await pg.type('#pinNew', TEST_PIN); await pg.type('#pinConfirm', TEST_PIN); } else await pg.type('#pinLogin', TEST_PIN); await pg.click('#lockForm button[type=submit]'); await pg.waitForSelector('#topbar', { visible: true, timeout: 8000 }); await sleep(900); };
+  await pg.goto(URL); await pg.evaluate(() => localStorage.clear()); await pg.reload(); await unlock();
 
   await t('first run seeds Sewing Studio client + Content work £22/hour item', async () => {
     const d = await db(); assert.strictEqual(d.clients.length, 1); assert.match(d.clients[0].name, /Sewing Studio/); assert.match(d.clients[0].address, /10 Chapel Street/);
@@ -33,10 +36,10 @@ let pass = 0; const t = async (name, fn) => { try { await fn(); pass++; console.
     await pg.click('.tpl-pick label:nth-child(2)'); await sleep(100); s = (await db()).settings; assert.strictEqual(s.template, 'modern'); assert(await pg.$('#setPreview .paper.t-modern'));
     await setVal('[data-s="accentHex"]', '#008080'); await pg.click('.tpl-pick label:nth-child(1)'); await sleep(100); assert.strictEqual((await db()).settings.template, 'classic'); });
 
-  await t('logo upload stored as data URL', async () => {
+  await t('logo upload stored as an image ref (data lives in IndexedDB), preview shows it', async () => {
     const png = path.join('/tmp', 'logo-test.png'); fs.copyFileSync(path.join(__dirname, '..', 'icon-192.png'), png);
     const inp = await pg.$('#logoFile'); await inp.uploadFile(png); await sleep(500);
-    assert((await db()).settings.logo.startsWith('data:image/png')); assert(await pg.$('#setPreview .p-logo'));
+    assert((await db()).settings.logo.startsWith('img:')); await sleep(300); assert(await pg.$eval('#setPreview .p-logo', e => e.src.startsWith('data:image/png')));
     await click('[data-act="rmLogo"]'); assert.strictEqual((await db()).settings.logo, ''); });
 
   await t('timesheet JSON import: 15 days / 112.5 h / £2,475.00 -> invoice', async () => {
@@ -76,18 +79,20 @@ let pass = 0; const t = async (name, fn) => { try { await fn(); pass++; console.
     const t0 = require('child_process').execSync('pdftotext -layout /tmp/invoice-print.pdf -').toString(); assert(/INV-0001/.test(t0) && /£2,475\.00/.test(t0) && !/Dashboard|Export CSV|Mark paid/.test(t0), 'print has only the invoice');
     await pg.emulateMediaType('screen'); });
 
-  await t('Download PDF (jsPDF + html2canvas) produces an A4 PDF', async () => {
-    await pg.setViewport({ width: 390, height: 844, isMobile: true }); await sleep(100); // mobile layout must still give the desktop A4 render
-    await click('[data-act="pdf"]'); let f; for (let i = 0; i < 40 && !f; i++) { await sleep(500); f = fs.readdirSync(dl).find(n => /^INV-0001.*\.pdf$/.test(n)); }
-    await pg.setViewport({ width: 1280, height: 800 });
-    if (!f) { console.log('     (CDN unreachable here – fell back to print dialog; not a failure of the app)'); return; }
-    const info = require('child_process').execSync('pdfinfo ' + path.join(dl, f)).toString(); assert(/A4/.test(info), info); console.log('     downloaded', f, (info.match(/Pages:\s+\d+/) || [''])[0]);
-    require('child_process').execSync('pdftoppm -r 50 -png ' + path.join(dl, f) + ' /tmp/dlpdf'); });
+  await t('Download PDF builds a text-based A4 PDF (selectable text, £ and – survive)', async () => {
+    await pg.setViewport({ width: 390, height: 844, isMobile: true }); await sleep(100); // mobile viewport must not matter
+    await click('[data-act="pdf"]'); let f; for (let i = 0; i < 40 && !f; i++) { await sleep(300); f = fs.readdirSync(dl).find(n => /^INV-0001.*\.pdf$/.test(n)); }
+    await pg.setViewport({ width: 1280, height: 800 }); assert(f, 'PDF downloaded');
+    const info = require('child_process').execSync('pdfinfo "' + path.join(dl, f) + '"').toString(); assert(/A4/.test(info), info);
+    const txt = require('child_process').execSync('pdftotext -layout "' + path.join(dl, f) + '" -').toString();
+    assert(/INV-0001/.test(txt) && /The Sewing Studio/.test(txt) && /£2,475\.00/.test(txt) && /Content work . 21\/10\/2026 \(09:30.17:00\)/.test(txt) && /Bank: Example Bank/.test(txt), txt.slice(0, 600));
+    console.log('     PDF:', f, (info.match(/Pages:\s+\d+/) || [''])[0], '· text dash char:', JSON.stringify((txt.match(/Content work (.) 21/) || [])[1]));
+    require('child_process').execSync('pdftoppm -r 60 -png "' + path.join(dl, f) + '" /tmp/dlpdf'); });
 
   await t('service worker caches the shell: app reloads offline', async () => {
     await pg.evaluate(() => navigator.serviceWorker.ready.then(() => 1)); await sleep(500); await pg.reload(); await sleep(500);
     await pg.setOfflineMode(true); await pg.reload({ waitUntil: 'domcontentloaded' }); await sleep(600);
-    assert.match(await txt('#topbar'), /Invoice\s*GoGo/); assert((await txt('#page')).length > 20); await pg.setOfflineMode(false); });
+    assert.match(await txt('#topbar'), /Invoice\s*GoGo/); assert((await txt('#page')).length > 20); assert.match(await txt('#syncInd'), /Offline/i); await pg.setOfflineMode(false); });
 
   await t('delete invoice releases timesheet sessions', async () => {
     await click('[data-act="delDoc"]'); await sleep(200); const d = await db(); assert.strictEqual(d.invoices.length, 0); assert.strictEqual(Object.keys(d.imported).length, 0); });
@@ -119,7 +124,7 @@ let pass = 0; const t = async (name, fn) => { try { await fn(); pass++; console.
     await hash('items'); await click('[data-act="newItem"]'); await setVal('#modalBg [data-k="name"]', 'Editing'); await setVal('#modalBg [data-k="rate"]', '30'); await click('#modalBg [data-mb]', 'Save'); await sleep(150); assert.match(await txt(), /Editing/);
     await hash('expenses'); await click('[data-act="newExpense"]'); await setVal('#modalBg [data-k="amount"]', '49.99'); await setVal('#modalBg [data-k="note"]', 'Reflector'); await setVal('#modalBg [data-k="projectId"]', (await db()).projects[0].id);
     await (await pg.$('#modalBg input[type=file]')).uploadFile(path.join(__dirname, '..', 'icon-192.png')); await sleep(500); await click('#modalBg [data-mb]', 'Save'); await sleep(200);
-    const d = await db(); assert.strictEqual(d.expenses[0].amount, 49.99); assert(d.expenses[0].receipt.startsWith('data:image/jpeg')); assert(await pg.$('img.thumb')); });
+    const d = await db(); assert.strictEqual(d.expenses[0].amount, 49.99); assert(d.expenses[0].receipt.startsWith('img:')); assert(await pg.$('img.thumb')); });
 
   await t('dashboard & reports numbers', async () => {
     await pg.evaluate(() => { const d = JSON.parse(localStorage.getItem('igg_invoices')); const i = d.find(x => x.number === 'INV-0002'); i.status = 'paid'; i.paidDate = new Date().toISOString().slice(0, 7) + '-05'; localStorage.setItem('igg_invoices', JSON.stringify(d)); location.hash = '#/dashboard'; location.reload(); }); await sleep(500);
@@ -140,7 +145,7 @@ let pass = 0; const t = async (name, fn) => { try { await fn(); pass++; console.
     assert.strictEqual(d.invoices.length, before.invoices.length); assert.strictEqual(d.settings.nextInvoice, before.settings.nextInvoice); assert.strictEqual(d.expenses.length, before.expenses.length); });
 
   // ---- screenshots with demo data + realistic settings ----
-  await pg.evaluate(() => localStorage.clear()); await pg.reload(); await sleep(300);
+  const srv2 = await startDevServer({ port: 8766 }); await pg.goto('http://localhost:8766/'); await pg.evaluate(() => localStorage.clear()); await pg.reload(); await unlock();
   await pg.evaluate(() => { const s = JSON.parse(localStorage.getItem('igg_settings')); Object.assign(s, { email: 'james@example.com', phone: '07000 000000', address: 'Cornwall, UK', bankName: 'Example Bank', accountName: 'J Moriarty', sortCode: '00-00-00', accountNumber: '00000000', lateNote: true, template: 'modern' }); localStorage.setItem('igg_settings', JSON.stringify(s)); }); await pg.reload(); await sleep(300);
   await hash('settings'); await click('[data-act="loadDemo"]'); await sleep(300);
   // import screens first (nothing invoiced yet). Viewport switches reload the page, so upload again after each.
@@ -165,5 +170,5 @@ let pass = 0; const t = async (name, fn) => { try { await fn(); pass++; console.
   await hash('reports'); await shot('reports-desktop', 1280, 900); await hash('cashflow'); await shot('cashflow-desktop', 1280, 900);
 
   assert.strictEqual(errs.length, 0, 'console/page errors:\n' + errs.join('\n'));
-  console.log(pass + ' e2e checks passed'); await b.close();
+  console.log(pass + ' e2e checks passed'); await b.close(); await srv1.close(); await srv2.close();
 })().catch(e => { console.error('CRASH', e); process.exit(1); });
