@@ -1,10 +1,10 @@
-// Cloud / lock / sync / Gmail / Drive / PDF end-to-end tests. Local dev server only (real API handler, in-memory blobs).
+// Cloud (MANUAL sync) / lock / Gmail / Drive / PDF end-to-end tests. Local dev server only (real API handler, in-memory blobs).
 // Google is a TEST HARNESS: a fake window.google plus request interception with canned responses. The app itself never fakes success.
 // Run: NODE_PATH=<dir with puppeteer-core> TZ=Europe/London node tests/cloud.e2e.js
 const puppeteer = require('puppeteer-core'); const fs = require('fs'); const path = require('path'); const assert = require('assert'); const cp = require('child_process');
 const PIN = 'cloud-test-pin-9'; const SHOTS = path.join(__dirname, '..', 'screenshots'); fs.mkdirSync(SHOTS, { recursive: true });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-let pass = 0; const t = async (name, fn) => { try { await fn(); pass++; console.log('ok  -', name); } catch (e) { process.exitCode = 1; console.error('FAIL -', name, '\n  ', String(e.stack || e).split('\n').slice(0, 5).join('\n   ')); } };
+let pass = 0; const ONLY = process.env.ONLY; const t = async (name, fn) => { if (ONLY && !name.includes(ONLY)) return; try { await fn(); pass++; console.log('ok  -', name); } catch (e) { process.exitCode = 1; console.error('FAIL -', name, '\n  ', String(e.stack || e).split('\n').slice(0, 5).join('\n   ')); } };
 const until = async (fn, ms = 8000, what = 'condition') => { const t0 = Date.now(); for (;;) { let v; try { v = await fn(); } catch (e) { v = false; } if (v) return v; if (Date.now() - t0 > ms) throw new Error('timeout waiting for ' + what); await sleep(120); } };
 
 (async () => {
@@ -14,6 +14,7 @@ const until = async (fn, ms = 8000, what = 'condition') => { const t0 = Date.now
   async function open(port, { ip, google } = {}) {
     const ctx = await browser.createBrowserContext(); const pg = await ctx.newPage(); pg.ctx = ctx; pg.base = 'http://localhost:' + port + '/';
     await pg.setExtraHTTPHeaders({ 'Accept-Language': 'en-GB', ...(ip ? { 'x-test-ip': ip } : {}) });
+    if (process.env.DEBUG) pg.on('console', m => console.log('     [console]', m.text().slice(0, 200)));
     pg.on('pageerror', e => errs.push(e.message)); pg.on('dialog', d => d.accept());
     pg.on('console', m => { if (m.type() === 'error' && !/net::ERR|Failed to load resource|401|409|429|403|404|fonts\.gstatic|CORS policy/.test(m.text())) errs.push(m.text()); });
     if (google) await pg.evaluateOnNewDocument(GOOGLE_MOCK);
@@ -27,7 +28,7 @@ const until = async (fn, ms = 8000, what = 'condition') => { const t0 = Date.now
         const scope = m === 'driveOnly' ? 'https://www.googleapis.com/auth/drive.file' : m === 'gmailOnly' ? 'https://www.googleapis.com/auth/gmail.send' : 'https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/drive.file';
         c.callback({ access_token: 'fake-token-' + window.__gCalls, expires_in: 3599, scope }); }, 40); } }) } } };`;
   const lockUp = async (pg, { pin = PIN, code } = {}) => { await pg.waitForSelector('#lockForm'); if (await pg.$('#pinNew')) { await pg.type('#pinNew', pin); await pg.type('#pinConfirm', pin); if (code && await pg.$('#setupCode')) await pg.type('#setupCode', code); } else await pg.type('#pinLogin', pin); await pg.click('#lockForm button[type=submit]'); };
-  const enter = async (pg, o) => { await lockUp(pg, o); await pg.waitForSelector('#topbar', { visible: true, timeout: 8000 }); await until(() => pg.$eval('#syncInd', e => /Synced/.test(e.innerText)), 8000, 'Synced'); };
+  const enter = async (pg, o) => { await lockUp(pg, o); await pg.waitForSelector('#syncBtn', { visible: true, timeout: 8000 }); await sleep(300); }; // signing in does NOT sync any more
   const ev = (pg, fn, ...a) => pg.evaluate(fn, ...a);
   const shot = async (pg, n, clip) => { await ev(pg, () => { const x = document.getElementById('toast'); if (x) x.remove(); }); await sleep(250); await pg.screenshot({ path: path.join(SHOTS, n + '.png'), ...(clip ? { clip } : {}) }); };
   const rawTok = pg => ev(pg, () => localStorage.getItem('igg_token')); const token = async pg => { const r = await rawTok(pg); return r ? JSON.parse(r).token : null; };
@@ -36,7 +37,7 @@ const until = async (fn, ms = 8000, what = 'condition') => { const t0 = Date.now
   const mk = (pg, type, over = {}) => ev(pg, (type, over) => { const g = __igg, d = g.newDoc(type, over); delete d.isNew; if (!d.number) { const s = g.db().settings; d.number = (type === 'estimate' ? 'EST-' : 'INV-') + String(type === 'estimate' ? s.nextEstimate++ : s.nextInvoice++).padStart(4, '0'); g.save('settings'); } d.createdAt = new Date().toISOString(); g.db().invoices.push(d); g.save('invoices'); return d.id; }, type, over);
   const clientId = pg => ev(pg, () => __igg.db().clients[0].id);
   const inv = (pg, id) => ev(pg, id => JSON.parse(JSON.stringify(__igg.db().invoices.find(d => d.id === id) || null)), id);
-  const sync = pg => ev(pg, () => __igg.syncNow(true)).then(() => until(() => pg.$eval('#syncInd', e => /Synced/.test(e.innerText)), 8000, 'sync done')).then(() => sleep(150));
+  const sync = pg => ev(pg, () => __igg.syncNow(true)).then(() => until(() => pg.$eval('#syncInd', e => /^Synced \d/.test(e.innerText.trim())), 8000, 'sync done')).then(() => sleep(150)); // = pressing Sync data
 
   // ================= AUTH / LOCK =================
   const authSrv = await startDevServer({ port: 8770, env: { IGG_SETUP_CODE: 'setup-code-123' } }); authSrv.port = 8770;
@@ -47,11 +48,11 @@ const until = async (fn, ms = 8000, what = 'condition') => { const t0 = Date.now
     assert.strictEqual((await api(authSrv, 'data', { tok: 'garbage.token' })).status, 401);
     assert.strictEqual((await api(authSrv, 'login', { method: 'POST', body: { pin: 'whatever1' } })).status, 409, 'login before any PIN exists'); });
   await t('first run: Create-PIN screen (needs the setup code) -> wrong code refused -> PIN created -> app opens & syncs', async () => {
-    a1 = await open(8770, { ip: 'a1' }); await a1.waitForSelector('#pinNew'); assert(await a1.$('#setupCode')); assert(await a1.$eval('body', b => b.classList.contains('locked')));
+    const logBase = authSrv.reqLog.length; a1 = await open(8770, { ip: 'a1' }); await a1.waitForSelector('#pinNew'); assert(await a1.$('#setupCode')); assert(await a1.$eval('body', b => b.classList.contains('locked')));
     await a1.setViewport({ width: 1280, height: 800 }); await a1.type('#pinNew', PIN); await a1.type('#pinConfirm', PIN); await a1.type('#setupCode', 'nope'); await shot(a1, 'v2-01-create-pin');
     await a1.click('#lockForm button[type=submit]'); await until(() => a1.$eval('#lockErr', e => /setup code/i.test(e.innerText)), 5000, 'wrong setup code message');
     await a1.$eval('#setupCode', e => { e.value = ''; }); await a1.type('#setupCode', 'setup-code-123'); await a1.click('#lockForm button[type=submit]');
-    await a1.waitForSelector('#topbar', { visible: true }); await until(() => a1.$eval('#syncInd', e => /Synced/.test(e.innerText))); assert(!(await a1.$('#lock')));
+    await a1.waitForSelector('#topbar', { visible: true }); await sleep(600); assert(!(await a1.$('#lock'))); assert.deepStrictEqual(authSrv.reqLog.slice(logBase).map(r => r.method + ' ' + r.path).filter(x => !/status/.test(x)), ['POST /api/setup', 'POST /api/setup'], 'signing in made no sync call');
     assert.strictEqual((await api(authSrv, 'setup', { method: 'POST', body: { pin: 'another-pin1', setupCode: 'setup-code-123' } })).status, 409, 'second setup refused'); });
   await t('sign-in screen on a new device: wrong PIN refused with message; correct PIN works; screenshot', async () => {
     const p = await open(8770, { ip: 'a2' }); await p.waitForSelector('#pinLogin'); assert(!(await p.$('#pinNew'))); await shot(p, 'v2-02-sign-in');
@@ -62,16 +63,18 @@ const until = async (fn, ms = 8000, what = 'condition') => { const t0 = Date.now
     for (let i = 0; i < 6; i++) { await p.$eval('#pinLogin', e => { e.value = ''; }); await p.type('#pinLogin', 'bad-pin-' + i); await p.click('#lockForm button[type=submit]'); await sleep(450); last = await p.$eval('#lockErr', e => e.innerText); }
     assert(/too many/i.test(last), last); await p.$eval('#pinLogin', e => { e.value = ''; }); await p.type('#pinLogin', PIN); await p.click('#lockForm button[type=submit]'); await sleep(600);
     assert(/too many/i.test(await p.$eval('#lockErr', e => e.innerText))); assert.strictEqual(await token(p), null); await p.ctx.close(); });
-  await t('tampered / expired token: API 401 and the app falls back to the lock screen', async () => {
+  await t('tampered / expired token: API 401; the app opens from local data (no network at load) and shows the lock screen when you press Sync data', async () => {
     const tk = await token(a1); const bad = tk.slice(0, -3) + (tk.endsWith('AAA') ? 'BBB' : 'AAA'); assert.strictEqual((await api(authSrv, 'data', { tok: bad })).status, 401); assert.strictEqual((await api(authSrv, 'data', { tok: tk })).status, 200);
-    await ev(a1, b => localStorage.setItem('igg_token', JSON.stringify({ token: b, expires: Date.now() + 1e9 })), bad); await a1.reload(); await until(() => a1.$('#lockForm'), 8000, 'lock screen'); assert(/session ended|PIN/i.test(await a1.$eval('#lock', e => e.innerText)));
-    await a1.type('#pinLogin', PIN); await a1.click('#lockForm button[type=submit]'); await a1.waitForSelector('#topbar', { visible: true }); });
+    await ev(a1, b => localStorage.setItem('igg_token', JSON.stringify({ token: b, expires: Date.now() + 1e9 })), bad); const n0 = authSrv.reqLog.length; await a1.reload(); await a1.waitForSelector('#syncBtn', { visible: true }); await sleep(1200); assert.strictEqual(authSrv.reqLog.length, n0, 'reload made no API call');
+    await a1.click('#syncBtn'); await until(() => a1.$('#lockForm'), 8000, 'lock screen'); assert(/session ended|PIN/i.test(await a1.$eval('#lock', e => e.innerText)));
+    await a1.type('#pinLogin', PIN); await a1.click('#lockForm button[type=submit]'); await a1.waitForSelector('#syncBtn', { visible: true }); });
   await authSrv.close();
 
   // ================= SYNC (two devices) =================
   const srv = await startDevServer({ port: 8771 }); srv.port = 8771;
   const A = await open(8771, { ip: 'sa' }); await A.setViewport({ width: 1280, height: 800 }); await enter(A);
   const B = await open(8771, { ip: 'sb' }); await enter(B);
+  await sync(A); await sync(B); // first press on each (still empty) device: silent, no dialog
   await t('two devices: same seed data (no duplicates) after first sign-in', async () => {
     const [ca, cb] = [await ev(A, () => __igg.db().clients.map(c => c.id)), await ev(B, () => __igg.db().clients.map(c => c.id))]; assert.deepStrictEqual(ca, cb); assert.strictEqual(ca.length, 1);
     assert.strictEqual(await ev(A, () => __igg.db().items.length), await ev(B, () => __igg.db().items.length)); });
@@ -89,14 +92,42 @@ const until = async (fn, ms = 8000, what = 'condition') => { const t0 = Date.now
     await ev(A, id => { __igg.docOf(id).notes = 'edited on A (earlier)'; __igg.save('invoices'); }, id); await sleep(80); await ev(B, id => { __igg.docOf(id).notes = 'edited on B (later)'; __igg.save('invoices'); }, id);
     await A.setOfflineMode(false); await B.setOfflineMode(false); await sync(A); await sync(B); await sync(A);
     assert.strictEqual((await inv(A, id)).notes, 'edited on B (later)'); assert.strictEqual((await inv(B, id)).notes, 'edited on B (later)'); });
-  await t('offline indicator + queue: change made offline shows Offline, uploads automatically when back online', async () => {
+  await t('offline: pressing Sync data says so (nothing lost, nothing sent); the next press uploads the queued change', async () => {
     await A.setOfflineMode(true); await sleep(200); const id = await mk(A, 'invoice', { clientId: await clientId(A), notes: 'made offline' });
-    await until(() => A.$eval('#syncInd', e => /Offline/.test(e.innerText)), 6000, 'Offline indicator'); const txt = await A.$eval('#syncInd', e => e.innerText); console.log('     indicator offline text:', JSON.stringify(txt));
-    await A.hash; await shot(A, 'v2-03-sync-offline', { x: 0, y: 0, width: 1280, height: 120 });
-    assert(!(await serverState(srv, await token(B))).collections.invoices.some(r => r.id === id), 'not on server yet');
-    await A.setOfflineMode(false); await until(() => A.$eval('#syncInd', e => /Synced/.test(e.innerText)), 12000, 'Synced after reconnect');
-    assert((await serverState(srv, await token(B))).collections.invoices.some(r => r.id === id && !r.deleted), 'uploaded after reconnect');
-    await shot(A, 'v2-04-sync-synced', { x: 0, y: 0, width: 1280, height: 120 }); });
+    await until(() => A.$eval('#syncInd', e => /Unsynced changes \(\d+\)/.test(e.innerText)), 6000, 'Unsynced changes indicator'); const txt = await A.$eval('#syncInd', e => e.innerText.trim()); console.log('     indicator:', JSON.stringify(txt));
+    await A.click('#syncBtn'); await until(() => A.$eval('#toast', e => /offline/i.test(e.innerText)), 4000, 'offline toast'); assert(/Sync failed/.test(await A.$eval('#syncInd', e => e.innerText))); assert(!(await serverState(srv, await token(B))).collections.invoices.some(r => r.id === id), 'not on server');
+    await A.setOfflineMode(false); await sleep(1500); assert(!(await serverState(srv, await token(B))).collections.invoices.some(r => r.id === id), 'coming back online does NOT sync by itself');
+    await A.click('#syncBtn'); await until(() => A.$eval('#syncInd', e => /^Synced \d/.test(e.innerText.trim())), 8000, 'Synced');
+    assert((await serverState(srv, await token(B))).collections.invoices.some(r => r.id === id && !r.deleted), 'uploaded on the next press'); });
+  await t('status indicator + Sync data button: Not synced yet -> Unsynced changes (n) -> Synced hh:mm -> Not synced since hh:mm after a reload; button visible on desktop and phone; screenshots', async () => {
+    const L = pg => pg.$eval('#syncInd', e => e.innerText.trim()); const F = await open(8771, { ip: 'sf' }); await F.setViewport({ width: 1280, height: 800 }); await enter(F);
+    assert.strictEqual(await L(F), 'Not synced yet'); await F.screenshot({ path: path.join(SHOTS, 'v3-desktop-sync-button-fresh.png') });
+    const bb = await F.$eval('#syncBtn', e => { const r = e.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height, text: e.innerText.trim() }; }); assert(bb.text === 'Sync data' && bb.y >= 0 && bb.y + bb.h <= 56 + 2 && bb.x + bb.w <= 1280, JSON.stringify(bb));
+    const ind = await F.$eval('#syncInd', e => e.getBoundingClientRect().right); assert(ind <= bb.x + 1, 'indicator is beside (left of) the button');
+    await F.click('#syncBtn'); await until(async () => /^Synced \d\d:\d\d$/.test(await L(F)), 8000, 'first press on an empty device syncs silently (no dialog)'); assert(!(await F.$('.modal')));
+    await ev(F, () => { const g = __igg; g.db().settings.phone = '01234 567890'; g.save('settings'); const c = g.db().clients[0]; c.notes = 'edited'; g.save('clients'); }); assert(/^Unsynced changes \(\d+\)$/.test(await L(F)), await L(F));
+    await F.screenshot({ path: path.join(SHOTS, 'v3-desktop-sync-button-unsynced.png') });
+    await F.click('#syncBtn'); await until(async () => /^Synced \d\d:\d\d$/.test(await L(F)), 8000, 'Synced hh:mm'); assert(/^Synced \d\d:\d\d$/.test(await L(F)));
+    await F.screenshot({ path: path.join(SHOTS, 'v3-desktop-sync-button-synced.png') });
+    await F.reload(); await F.waitForSelector('#syncBtn', { visible: true }); await sleep(500); assert(/^Not synced since \d\d:\d\d$/.test(await L(F)), await L(F));
+    await F.setViewport({ width: 390, height: 844, deviceScaleFactor: 2, isMobile: true, hasTouch: true }); await sleep(300);
+    const mb = await F.$eval('#syncBtn', e => { const r = e.getBoundingClientRect(); return { x: r.x, r: r.right, y: r.y, b: r.bottom, vis: getComputedStyle(e).display !== 'none' }; }); assert(mb.vis && mb.r <= 390 && mb.x >= 0 && mb.b <= 60, JSON.stringify(mb));
+    const mi = await F.$eval('#syncInd', e => { const r = e.getBoundingClientRect(); return { x: r.x, r: r.right }; }); assert(mi.r <= mb.x + 1 && mi.x >= 0, 'indicator beside button on phone ' + JSON.stringify(mi));
+    await F.screenshot({ path: path.join(SHOTS, 'v3-phone-sync-button-not-synced.png') });
+    await ev(F, () => { const g = __igg; g.db().settings.phone = '09999 999999'; g.save('settings'); }); await sleep(200); await F.screenshot({ path: path.join(SHOTS, 'v3-phone-sync-button-unsynced.png') });
+    await F.click('#syncBtn'); await until(async () => /^Synced \d\d:\d\d$/.test(await L(F)), 8000); await F.screenshot({ path: path.join(SHOTS, 'v3-phone-sync-button-synced.png') });
+    await F.ctx.close(); });
+  await t('NOTHING touches /api/* by itself: 20 s of idle + edits + online/offline + tab hide/show -> zero requests; then one press = exactly GET data? + POST sync', async () => {
+    const H = await open(8771, { ip: 'sh' }); await enter(H); await H.click('#syncBtn'); await until(() => H.$eval('#syncInd', e => /^Synced \d/.test(e.innerText.trim())), 8000); await sleep(300); const n0 = srv.reqLog.length;
+    await sleep(8000); await ev(H, () => { const g = __igg; const id = g.newDoc('invoice', { clientId: g.db().clients[0].id }); delete id.isNew; id.number = 'INV-IDLE'; g.db().invoices.push(id); g.save('invoices'); g.db().expenses.push({ id: g.uid(), date: '2026-11-01', category: 'Other', amount: 1, note: 'x', projectId: '', receipt: '' }); g.save('expenses'); });
+    await H.setOfflineMode(true); await sleep(500); await H.setOfflineMode(false); await ev(H, () => { Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' }); document.dispatchEvent(new Event('visibilitychange')); Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' }); document.dispatchEvent(new Event('visibilitychange')); window.dispatchEvent(new Event('online')); window.dispatchEvent(new Event('focus')); });
+    await sleep(8000); assert.strictEqual(srv.reqLog.length, n0, 'unexpected API calls: ' + JSON.stringify(srv.reqLog.slice(n0)));
+    await H.click('#syncBtn'); await until(() => H.$eval('#syncInd', e => /^Synced \d/.test(e.innerText.trim())), 8000); const calls = srv.reqLog.slice(n0).map(r => r.method + ' ' + r.path); assert.deepStrictEqual(calls, ['POST /api/sync'], calls.join()); await H.ctx.close(); });
+  await t('optional "Auto-sync when app opens" (per device, default OFF): off = no call on open; on = exactly one sync on open', async () => {
+    const H = await open(8771, { ip: 'so' }); await enter(H); await ev(H, () => { location.hash = '#/settings'; }); await sleep(400); assert.strictEqual(await H.$eval('#autoSyncOpen', e => e.checked), false, 'default OFF');
+    await sleep(300); let n = srv.reqLog.length; await H.reload(); await H.waitForSelector('#syncBtn', { visible: true }); await sleep(1500); assert.strictEqual(srv.reqLog.length, n, 'OFF: no call on open');
+    await ev(H, () => { location.hash = '#/settings'; }); await sleep(300); await H.click('#autoSyncOpen'); await until(() => ev(H, () => localStorage.getItem('igg_autosync_open') === '1')); await H.click('#syncBtn'); await until(() => H.$eval('#syncInd', e => /^Synced \d/.test(e.innerText.trim())), 8000); await sleep(300); n = srv.reqLog.length;
+    await H.reload(); await H.waitForSelector('#syncBtn', { visible: true }); await until(() => H.$eval('#syncInd', e => /^Synced \d/.test(e.innerText.trim())), 8000, 'auto-sync on open'); await sleep(1500); assert.deepStrictEqual(srv.reqLog.slice(n).map(r => r.method + ' ' + r.path), ['POST /api/sync']); await H.ctx.close(); });
   await t('images sync: logo and receipt photo are separate blobs that load on the other device', async () => {
     const png = 'data:image/png;base64,' + fs.readFileSync(path.join(__dirname, '..', 'icon-192.png')).toString('base64');
     const [logoRef, rcpRef] = await ev(A, png => { const g = __igg; const l = g.saveImg(png), r = g.saveImg(png.replace('image/png', 'image/png')); g.db().settings.logo = l; g.save('settings'); g.db().expenses.push({ id: g.uid(), date: '2026-11-10', category: 'Equipment', amount: 12.5, note: 'cable', projectId: '', receipt: r }); g.save('expenses'); return [l, r]; }, png);
@@ -119,16 +150,17 @@ const until = async (fn, ms = 8000, what = 'condition') => { const t0 = Date.now
       localStorage.setItem('igg_expenses', JSON.stringify([{ id: 'e_old1', date: '2026-10-02', category: 'Travel', amount: 20, note: 'fuel', projectId: '', receipt: png }]));
       localStorage.setItem('igg_items', JSON.stringify([{ id: 'it_old1', name: 'Old item', rate: 10, unit: 'hour' }]));
       localStorage.setItem('igg_projects', '[]'); localStorage.setItem('igg_imported', '{}'); localStorage.setItem('igg_settings', JSON.stringify({ name: 'Old Biz', seeded: true, nextInvoice: 8 })); }, png);
-    await C.reload(); await lockUp(C); await until(() => C.$$eval('.modal h3', hs => hs.some(h => /Upload this device/.test(h.innerText))), 8000, 'upload dialog'); await shot(C, 'v2-05-migrate-upload');
+    await C.reload(); await lockUp(C); await C.waitForSelector('#syncBtn', { visible: true }); await sleep(1200); assert(!(await C.$('.modal')), 'no dialog until the button is pressed'); assert.deepStrictEqual(srv2.reqLog.map(r => r.path).filter(p => !/status/.test(p)), ['/api/setup'], 'sign-in made no sync call'); assert(/Unsynced changes/.test(await C.$eval('#syncInd', e => e.innerText)));
+    await C.click('#syncBtn'); await until(() => C.$$eval('.modal h3', hs => hs.some(h => /Upload this device/.test(h.innerText))), 8000, 'upload dialog after pressing Sync data'); await shot(C, 'v2-05-migrate-upload');
     await C.evaluate(() => [...document.querySelectorAll('.modal .btn')].find(b => /Upload to the cloud/.test(b.innerText)).click()); await until(() => C.$eval('#syncInd', e => /Synced/.test(e.innerText)), 8000, 'synced');
     const st = await serverState(srv2, await token(C)); const col = st.collections; assert(col.clients.some(c => c.id === 'c_old1'), 'client'); assert(col.invoices.some(c => c.id === 'i_old1'), 'invoice'); assert(col.expenses.some(c => c.id === 'e_old1' && /^img:/.test(c.receipt)), 'receipt became an image ref');
     assert.strictEqual(await ev(C, () => __igg.db().settings.name), 'Old Biz');
-    const D = await open(8772, { ip: 'md' }); await enter(D, { pin: PIN });
+    const D = await open(8772, { ip: 'md' }); await enter(D, { pin: PIN }); await D.click('#syncBtn'); await until(() => D.$eval('#syncInd', e => /^Synced \d/.test(e.innerText.trim())), 8000, 'D synced');
     assert(await ev(D, () => __igg.db().invoices.some(d => d.id === 'i_old1' && d.number === 'INV-0007'))); assert.strictEqual(await ev(D, () => __igg.db().settings.name), 'Old Biz');
-    assert((await ev(D, async () => await __igg.loadImg(__igg.db().expenses[0].receipt))).startsWith('data:image/png'), 'receipt image on 2nd device');
+    const reqsBefore = srv2.reqLog.length; assert((await ev(D, async () => await __igg.loadImg(__igg.db().expenses[0].receipt))).startsWith('data:image/png'), 'receipt image on 2nd device (fetched during the sync, not lazily)'); assert.strictEqual(srv2.reqLog.length, reqsBefore, 'showing images makes no API call');
     // a THIRD device that already has its own local data meets a non-empty cloud: Merge keeps both
-    const E = await open(8772, { ip: 'me' }); await ev(E, () => { localStorage.setItem('igg_clients', JSON.stringify([{ id: 'c_e1', name: 'Phone-only Client' }])); localStorage.setItem('igg_settings', JSON.stringify({ seeded: true })); }); await E.reload(); await lockUp(E);
-    await until(() => E.$$eval('.modal h3', hs => hs.some(h => /Combine/.test(h.innerText))), 8000, 'merge dialog'); await E.evaluate(() => [...document.querySelectorAll('.modal .btn')].find(b => /Merge both/.test(b.innerText)).click()); await until(() => E.$eval('#syncInd', e => /Synced/.test(e.innerText)), 8000);
+    const E = await open(8772, { ip: 'me' }); await ev(E, () => { localStorage.setItem('igg_clients', JSON.stringify([{ id: 'c_e1', name: 'Phone-only Client' }])); localStorage.setItem('igg_settings', JSON.stringify({ seeded: true })); }); await E.reload(); await lockUp(E); await E.waitForSelector('#syncBtn', { visible: true }); await E.click('#syncBtn');
+    await until(() => E.$$eval('.modal h3', hs => hs.some(h => /Combine/.test(h.innerText))), 8000, 'merge dialog'); await E.evaluate(() => [...document.querySelectorAll('.modal .btn')].find(b => /Merge both/.test(b.innerText)).click()); await until(() => E.$eval('#syncInd', e => /^Synced \d/.test(e.innerText.trim())), 8000, 'E synced').catch(async e => { throw new Error(e.message + ' ind=' + (await E.$eval('#syncInd', x => x.innerText)) + ' dirty=' + JSON.stringify(await ev(E, () => ({ d: __igg.S().dirty, p: __igg.S().pendImg, ts: __igg.S().ts }))) + ' modal=' + (await E.$eval('.modal', x => x.innerText).catch(() => 'none'))); });
     const names = await ev(E, () => __igg.db().clients.map(c => c.name).sort()); assert(names.includes('Phone-only Client') && names.includes('Old Client Ltd'), names.join()); assert((await serverState(srv2, await token(E))).collections.clients.some(c => c.id === 'c_e1'));
     await C.ctx.close(); await D.ctx.close(); await E.ctx.close(); await srv2.close(); });
 
@@ -138,6 +170,7 @@ const until = async (fn, ms = 8000, what = 'condition') => { const t0 = Date.now
   const fake = { gmail: [], gmailMode: 'ok', drive: [], calls: [], nid: 1, driveMode: 'ok' };
   await G.setRequestInterception(true);
   const pd = async req => req.postData() || (await req.fetchPostData());
+  const apiHits = []; G.on('request', req => { const m = req.url().match(/localhost:8773(\/api\/[^?]*)/); if (m) apiHits.push(req.method() + ' ' + m[1]); });
   G.on('request', async req => {
     const u = req.url(); const m = req.method(); const json = (status, o) => req.respond({ status, contentType: 'application/json', body: JSON.stringify(o), headers: { 'access-control-allow-origin': '*', 'access-control-allow-headers': '*', 'access-control-allow-methods': '*' } });
     if (/googleapis\.com|accounts\.google\.com/.test(u)) {
@@ -223,6 +256,7 @@ print(m.get_body(preferencelist=('plain',)).get_content().strip()[:60].replace('
   await t('Integrations + Apps pages reflect connected state; view doc shows sent + Drive info', async () => {
     await ev(G, id => { location.hash = '#/invoice/' + id; }, gInv); await sleep(300); const p = await G.$eval('#page', e => e.innerText); assert(/Emailed to accounts@sewingstudio\.test/.test(p) && /Saved to Drive/.test(p), p.slice(0, 500)); await shot(G, 'v2-12-invoice-sent-drive');
     await ev(G, () => { location.hash = '#/apps'; }); await sleep(300); const a = await G.$eval('#page', e => e.innerText); assert(/Client ID set/i.test(a) && /invoices? saved/.test(a), a.slice(0, 800)); });
+  await t('Gmail send, Drive save and auto-save-on-paid made NO calls to /api/* (no cloud sync triggered)', async () => { const hits = apiHits.filter(h => !/\/api\/(status|setup|login)$/.test(h)); assert.deepStrictEqual(hits, [], hits.join()); assert(fake.gmail.length >= 2 && fake.calls.some(c => c.uploaded)); });
   assert.strictEqual(await ev(G, () => window.__gNoGesture), undefined, 'every Google token request happened inside a click');
   await G.ctx.close(); await gsrv.close();
 

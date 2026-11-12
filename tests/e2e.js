@@ -92,7 +92,7 @@ let pass = 0; const t = async (name, fn) => { try { await fn(); pass++; console.
   await t('service worker caches the shell: app reloads offline', async () => {
     await pg.evaluate(() => navigator.serviceWorker.ready.then(() => 1)); await sleep(500); await pg.reload(); await sleep(500);
     await pg.setOfflineMode(true); await pg.reload({ waitUntil: 'domcontentloaded' }); await sleep(600);
-    assert.match(await txt('#topbar'), /Invoice\s*GoGo/); assert((await txt('#page')).length > 20); assert.match(await txt('#syncInd'), /Offline/i); await pg.setOfflineMode(false); });
+    assert.match(await txt('#topbar'), /Invoice\s*GoGo/); assert((await txt('#page')).length > 20); await pg.setOfflineMode(false); });
 
   await t('delete invoice releases timesheet sessions', async () => {
     await click('[data-act="delDoc"]'); await sleep(200); const d = await db(); assert.strictEqual(d.invoices.length, 0); assert.strictEqual(Object.keys(d.imported).length, 0); });
