@@ -52,14 +52,15 @@ function toWire(k, id) {
   if (!(id in cur)) return S.tombs[k][id] ? { id, deleted: true, updatedAt: S.tombs[k][id] } : null;
   if (k === 'settings') return Object.assign({ id: 'settings', updatedAt: S.ts.settings }, clone(db.settings));
   if (k === 'imported') return { id, invoiceId: db.imported[id], updatedAt: S.ts.imported[id] || Date.now() };
+  if (!cur[id].updatedAt) cur[id].updatedAt = 1; // never-edited seed records have no timestamp: they go up as the oldest possible version
   return clone(cur[id]);
 }
 let storageWarned = false;
 const lsSet = (key, v) => { try { localStorage.setItem(key, JSON.stringify(v)); return true; } catch (e) { if (!storageWarned) { storageWarned = true; toast('Storage is full – export a backup and remove big receipt photos.'); } return false; } };
 const writeKey = k => lsSet('igg_' + k, db[k]);
 const writeSync = () => lsSet('igg_sync', S);
-function save(k) { const ch = stamp(k); writeKey(k); writeSync(); if (ch) scheduleSync(); }
-const saveAll = () => { let ch = false; KEYS.forEach(k => { ch = stamp(k) || ch; writeKey(k); }); writeSync(); if (ch) scheduleSync(); };
+function save(k) { const ch = stamp(k); writeKey(k); writeSync(); if (ch) paintSync(); }
+const saveAll = () => { let ch = false; KEYS.forEach(k => { ch = stamp(k) || ch; writeKey(k); }); writeSync(); if (ch) paintSync(); };
 function resetSyncMeta() { S = { base: {}, tombs: {}, dirty: {}, ts: { settings: 0, imported: {} }, cloudInit: S.cloudInit, lastSync: 0, pendImg: S.pendImg || {} }; KEYS.forEach(k => { S.base[k] = {}; S.tombs[k] = {}; S.dirty[k] = {}; }); }
 function load() {
   KEYS.forEach(k => {
@@ -81,13 +82,16 @@ function normaliseLegacy() {
   if (typeof db.settings.logo === 'string' && db.settings.logo.startsWith('data:')) db.settings.logo = saveImg(db.settings.logo);
   db.expenses.forEach(x => { if (typeof x.receipt === 'string' && x.receipt.startsWith('data:')) x.receipt = saveImg(x.receipt); });
 }
-/** first-run seeding happens only after the first cloud sync, so a second device never re-creates (or resurrects) seed records */
+/** First-run seed records (the Sewing Studio client + "Content work" item). They are created locally at start-up and are NOT queued for upload
+ *  (their hashes are pre-recorded as "already synced"), so a second device never pushes duplicates and never resurrects a deleted seed. */
+function addSeedsClean() {
+  const c = { id: SEED_CLIENT, name: 'The Sewing Studio', contact: '', email: '', phone: '', address: '10 Chapel Street\nRedruth\nCornwall', notes: 'Regular client – hours imported from the timesheet app.' };
+  const i = { id: SEED_ITEM, name: 'Content work', description: 'Product photography, video & editing', rate: 22, unit: 'hour' };
+  db.clients.push(c); db.items.push(i); S.base.clients[c.id] = hashOf('clients', c); S.base.items[i.id] = hashOf('items', i); KEYS.forEach(writeKey); writeSync();
+}
 function maybeSeed() {
   if (db.settings.seeded) return;
-  if (!db.clients.length && !db.items.length) {
-    db.clients.push({ id: SEED_CLIENT, name: 'The Sewing Studio', contact: '', email: '', phone: '', address: '10 Chapel Street\nRedruth\nCornwall', notes: 'Regular client – hours imported from the timesheet app.' });
-    db.items.push({ id: SEED_ITEM, name: 'Content work', description: 'Product photography, video & editing', rate: 22, unit: 'hour' });
-  }
+  if (!db.clients.length && !db.items.length) addSeedsClean();
   db.settings.seeded = true; saveAll();
 }
 
@@ -96,13 +100,12 @@ const IMG = {}; let idbP = null;
 function idb() { return idbP || (idbP = new Promise((res, rej) => { const r = indexedDB.open('igg_img', 1); r.onupgradeneeded = () => r.result.createObjectStore('i'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); })); }
 const idbGet = k => idb().then(d => new Promise(res => { const q = d.transaction('i').objectStore('i').get(k); q.onsuccess = () => res(q.result || null); q.onerror = () => res(null); })).catch(() => null);
 const idbSet = (k, v) => idb().then(d => new Promise(res => { const tx = d.transaction('i', 'readwrite'); tx.objectStore('i').put(v, k); tx.oncomplete = () => res(true); tx.onerror = () => res(false); })).catch(() => false);
-function saveImg(dataURL) { const ref = 'img:' + uid(); IMG[ref] = dataURL; idbSet(ref, dataURL); S.pendImg[ref] = 1; writeSync(); scheduleSync(); return ref; }
+function saveImg(dataURL) { const ref = 'img:' + uid(); IMG[ref] = dataURL; idbSet(ref, dataURL); S.pendImg[ref] = 1; writeSync(); paintSync(); return ref; }
 const imgLoading = {};
 function loadImg(ref) {
   if (IMG[ref]) return Promise.resolve(IMG[ref]); if (imgLoading[ref]) return imgLoading[ref];
   imgLoading[ref] = (async () => {
     let v = await idbGet(ref);
-    if (!v && getTok()) { try { const r = await fetch('/api/' + ref.replace(':', '/'), { headers: { authorization: 'Bearer ' + getTok() } }); if (r.ok) { v = await r.text(); idbSet(ref, v); } } catch (e) { /* offline – try later */ } }
     delete imgLoading[ref]; if (v) { IMG[ref] = v; hydrateImages(); } return v;
   })();
   return imgLoading[ref];
@@ -127,6 +130,7 @@ const demoBadge = o => o.demo ? ' <span class="badge b-demo">Demo</span>' : '';
 const termsLabel = t => ({ 0: 'Due on receipt', 7: '7 days', 14: '14 days', 30: '30 days', custom: 'Custom date' }[t] || t + ' days');
 
 const IC = {
+  sync: '<path d="M20 11a8 8 0 0 0-14.2-4.5L4 9"/><path d="M4 4v5h5"/><path d="M4 13a8 8 0 0 0 14.2 4.5L20 15"/><path d="M20 20v-5h-5"/>',
   home: '<path d="M3 11l9-8 9 8"/><path d="M5 10v10h5v-6h4v6h5V10"/>',
   invoices: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h6"/>',
   estimates: '<path d="M9 4h6v3H9z"/><path d="M7 5H6a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-1"/><path d="M8 14l2.5 2.5L16 11"/>',
@@ -289,8 +293,8 @@ const NAV = [
 const TABS = [['dashboard', 'Home', 'home'], ['invoices', 'Invoices', 'invoices'], ['clients', 'Clients', 'clients'], ['expenses', 'Expenses', 'expenses'], ['more', 'More', 'more']];
 
 function buildShell() {
-  $('#topbar').innerHTML = `<a class="brand" href="#/dashboard"><img src="icon.svg" alt=""><span class="nm">Invoice <b>GoGo</b></span></a><div class="top-spacer"></div><button class="sync-ind" id="syncInd" data-act="syncNow" title="Cloud sync"></button>
-    <button class="btn-grey" id="btnNew" aria-haspopup="true">${ico('plus')} New</button>`;
+  $('#topbar').innerHTML = `<a class="brand" href="#/dashboard"><img src="icon.svg" alt=""><span class="nm">Invoice <b>GoGo</b></span></a><div class="top-spacer"></div><div class="sync-ind" id="syncInd" role="status" title="Cloud sync"></div><button class="btn-grey sync-btn" id="syncBtn" data-act="syncNow" title="Merge this device with the cloud (manual)">${ico('sync')}<span>Sync data</span></button>
+    <button class="btn-grey" id="btnNew" aria-label="New" aria-haspopup="true">${ico('plus')}<span class="lbl">New</span></button>`;
   $('#sidebar').innerHTML = NAV.map((n, i) => `${i === 3 || i === 7 || i === 9 ? '<div class="sep"></div>' : ''}<a href="#/${n[0]}" data-nav="${n[0]}">${ico(n[2])}<span>${n[1]}</span></a>`).join('');
   $('#tabbar').innerHTML = TABS.map(n => `<a href="#/${n[0]}" data-nav="${n[0]}">${ico(n[2])}<span>${n[1]}</span></a>`).join('');
   $('#btnNew').addEventListener('click', e => {
@@ -802,7 +806,7 @@ VIEWS.apps = function () {
   const gBadge = gset ? '<span class="badge b-sent">Client ID set</span>' : '<span class="badge b-overdue">Needs setup</span>';
   return `<div class="page-head"><h1>Integrated apps</h1></div>
   <div class="grid g2">
-  ${card('cashflow', 'Cloud sync (Netlify) <span id="cloudBadge"></span>', `<span id="cloudStatus">${cloudStatusHTML()}</span><br>Your data is stored privately in Netlify Blobs behind your PIN, and kept on each device for offline use.`, `<div class="btn-row"><button class="btn" data-act="syncNow">Sync now</button><a class="btn" href="#/settings">Security</a></div>`)}
+  ${card('cashflow', 'Cloud sync (Netlify) <span id="cloudBadge"></span>', `<span id="cloudStatus">${cloudStatusHTML()}</span><br>Manual sync only – press <b>Sync data</b> when you want this device and the cloud to match. Your data is stored privately in Netlify Blobs behind your PIN, and always kept on this device too.`, `<div class="btn-row"><button class="btn primary" data-act="syncNow">Sync data</button><a class="btn" href="#/settings">Security &amp; options</a></div>`)}
   ${card('invoices', 'Gmail ' + gBadge, gset ? `Emails invoices and estimates from your own Gmail with the PDF attached. ${sentN ? `<b>${sentN}</b> sent so far.` : 'None sent yet.'} Google asks you to approve access the first time (and about weekly while the app is in “Testing”).` : 'Not set up – needs a Google Client ID (free, about 5 minutes). Until then the “Email to client” button shows the setup steps.', `<div class="btn-row"><a class="btn ${gset ? '' : 'primary'}" href="#/settings">${gset ? 'Integrations settings' : 'Set up Google'}</a><button class="btn" data-act="googleHelp">Setup steps</button></div>`)}
   ${card('drive', 'Google Drive ' + gBadge, gset ? `Saves PDFs to <b>${esc(db.settings.driveRoot || 'Invoice GoGo')} / Client / INV-….pdf</b>${db.settings.driveOnSend || db.settings.driveOnPaid ? ' automatically when ' + [db.settings.driveOnSend && 'emailed', db.settings.driveOnPaid && 'marked paid'].filter(Boolean).join(' or ') : ' (use “Save to Drive” on any invoice, or switch on auto-save in Settings)'}. <b>${driveN}</b> invoice${driveN === 1 ? '' : 's'} saved.` : 'Not set up – uses the same Google Client ID as Gmail. Needs the Drive API enabled.', `<div class="btn-row"><a class="btn" href="#/settings">Integrations settings</a></div>`)}
   ${card('clock', 'Sewing Studio Timesheet <span class="badge b-done">Available</span>', `Turn the hours you log into an invoice in a couple of taps. Export <b>Backup (JSON)</b> or <b>CSV</b> from the timesheet app, then import it here. ${imported ? `<br><b>${imported}</b> sessions already invoiced.` : ''}`, `<div class="btn-row"><a class="btn primary" href="#/import">Import from Sewing Studio Timesheet</a><a class="btn" target="_blank" rel="noopener" href="https://sewing-studio-timesheet.netlify.app/">Open timesheet app</a></div>`)}
@@ -917,7 +921,9 @@ VIEWS.settings = function () {
     ${S_TEXT('footer', 'Footer text')}
     <div class="label note" style="margin-bottom:.4rem">Live preview</div><div id="setPreview" class="doc-wrap"></div></div>
   <div class="card"><h3>Cloud sync &amp; security</h3><p id="cloudStatus" style="margin-top:0">${cloudStatusHTML()}</p>
-    <div class="btn-row"><button class="btn" data-act="syncNow">Sync now</button><button class="btn" data-act="lockDevice">Lock this device</button></div>
+    <p class="note">Sync is <b>manual</b>: nothing is sent to the cloud until you press <b>Sync data</b> (top bar). Press it after you've made or changed invoices, and again on your other device to pick them up.</p>
+    <label class="chk" style="margin:.4rem 0 .7rem"><input type="checkbox" id="autoSyncOpen" ${autoOpen() ? 'checked' : ''}> Auto-sync when the app opens <span class="note">(this device only; off by default – each sync uses a little of the Netlify free allowance)</span></label>
+    <div class="btn-row"><button class="btn primary" data-act="syncNow">Sync data</button><button class="btn" data-act="lockDevice">Lock this device</button></div>
     <hr style="border:none;border-top:1px solid var(--border);margin:.9rem 0"><div class="card-h" style="font-size:.9rem;margin-bottom:.5rem">Change PIN</div>
     <form id="pinChangeForm" autocomplete="off"><div class="row3"><div class="fg"><label>Current</label><input type="password" id="pcCur" autocomplete="current-password" required></div><div class="fg"><label>New (6+)</label><input type="password" id="pcNew" autocomplete="new-password" required></div><div class="fg"><label>Repeat new</label><input type="password" id="pcRep" autocomplete="new-password" required></div></div>
     <div id="lockErr" class="lock-err"></div><button class="btn small" type="submit">Change PIN</button></form></div>
@@ -1080,16 +1086,37 @@ document.addEventListener('submit', async e => {
   } catch (e2) { fail(isNet(e2) ? "Can't reach the server – check your connection." : String(e2.message || e2)); }
 });
 
-/* ================= cloud sync ================= */
-let syncSt = 'idle', syncMsg = '', syncing = false, syncAgain = false, syncTimer = null;
+/* ================= cloud sync (MANUAL ONLY) =================
+ * Nothing in here runs by itself: no sync on load, none after edits, no timer, no "back online" trigger.
+ * The only network calls to /api/* are: /api/status (lock screen), /api/login|setup (signing in), /api/change-pin, and – when the
+ * "Sync data" button is pressed – GET /api/data (first press only), POST /api/sync and GET /api/img/* for images new from another device.
+ * Optional per-device setting "Auto-sync when app opens" (default OFF) does the same single sync at start-up. */
+let syncSt = 'idle', syncMsg = '', syncing = false, syncedThisPage = false;
+const AUTO_KEY = 'igg_autosync_open';
+const autoOpen = () => { try { return localStorage.getItem(AUTO_KEY) === '1'; } catch (e) { return false; } };
 const pendingCount = () => KEYS.reduce((n, k) => n + Object.keys(S.dirty[k] || {}).length, 0) + Object.keys(S.pendImg || {}).length;
-function setSync(st, msg) { syncSt = st; syncMsg = msg || ''; paintSync(); if (location.hash === '#/apps' || location.hash === '#/settings') { const c = $('#cloudStatus'); if (c) c.innerHTML = cloudStatusHTML(); } }
-function paintSync() {
-  const el = $('#syncInd'); if (!el) return; const n = pendingCount();
-  const m = { synced: ['Synced', 'ok', 'All changes are saved to the cloud' + (S.lastSync ? ' · last sync ' + new Date(S.lastSync).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : '')], syncing: ['Syncing…', 'busy', 'Talking to the cloud'], offline: ['Offline' + (n ? ' · ' + n + ' waiting' : ''), 'off', 'No connection – changes are saved on this device and will upload when you are back online'], error: ['Sync problem', 'err', syncMsg || 'Last sync failed – tap to retry'], locked: ['Locked', 'off', 'Sign in to sync'], idle: [n ? n + ' waiting' : 'Ready', 'off', 'Tap to sync'] }[syncSt];
-  el.className = 'sync-ind ' + m[1]; el.innerHTML = `<i class="dot"></i><span>${esc(m[0])}</span>`; el.title = m[2]; el.setAttribute('aria-label', 'Cloud sync: ' + m[0]);
+const hhmm = ts => new Date(ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+const sameDay = (a, b) => new Date(a).toDateString() === new Date(b).toDateString();
+const whenLabel = ts => sameDay(ts, Date.now()) ? hhmm(ts) : new Date(ts).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) + ' ' + hhmm(ts);
+/** what the indicator says: [text, css class, tooltip] */
+function syncLabel() {
+  const n = pendingCount(), last = S.lastSync;
+  if (syncSt === 'locked') return ['Locked', 'off', 'Sign in with your PIN, then press Sync data'];
+  if (syncSt === 'syncing') return ['Syncing…', 'busy', 'Talking to the cloud'];
+  if (syncSt === 'error') return ['Sync failed', 'err', syncMsg || 'The last sync did not finish – press Sync data to try again'];
+  const fresh = !last && !hasLocalData();
+  if (n > 0 && !fresh) return ['Unsynced changes (' + n + ')', 'warn', n + ' change' + (n === 1 ? '' : 's') + ' only on this device – press Sync data to upload'];
+  if (syncedThisPage && last && n === 0) return ['Synced ' + hhmm(last), 'ok', 'Merged with the cloud at ' + whenLabel(last)];
+  if (last) return ['Not synced since ' + whenLabel(last), 'off', 'Sync is manual – press Sync data to merge with the cloud'];
+  return ['Not synced yet', 'off', 'Sync is manual – press Sync data when you want this device and the cloud to match'];
 }
-function scheduleSync(delay) { paintSync(); if (!getTok() || !appStarted) return; clearTimeout(syncTimer); syncTimer = setTimeout(syncNow, delay || 1500); }
+function setSync(st, msg) { syncSt = st; syncMsg = msg || ''; paintSync(); const c = $('#cloudStatus'); if (c) c.innerHTML = cloudStatusHTML(); }
+function paintSync() {
+  const el = $('#syncInd'); if (!el) return; const m = syncLabel();
+  el.className = 'sync-ind ' + m[1]; el.innerHTML = `<i class="dot"></i><span>${esc(m[0])}</span>`; el.title = m[2]; el.setAttribute('aria-label', 'Cloud sync status: ' + m[0]);
+  const b = $('#syncBtn'); if (b) { b.disabled = syncing; b.querySelector('span').textContent = syncing ? 'Syncing…' : 'Sync data'; }
+  const c = $('#cloudStatus'); if (c) c.innerHTML = cloudStatusHTML();
+}
 ACT.syncNow = () => { syncNow(true); };
 const hasLocalData = () => db.invoices.length || db.expenses.length || db.projects.length || db.clients.some(c => c.id !== SEED_CLIENT) || db.items.some(i => i.id !== SEED_ITEM) || !!(db.settings.bankName || db.settings.email || db.settings.phone || db.settings.logo);
 function softRender() {
@@ -1104,6 +1131,15 @@ async function uploadPendingImages() {
     if (r.ok || r.status === 400 || r.status === 413) { if (!r.ok) console.warn('image rejected by server', ref, r.status); delete S.pendImg[ref]; } else if (r.status !== 401) throw new Error((r.json && r.json.error) || 'Image upload failed (HTTP ' + r.status + ')');
   }
   writeSync();
+}
+/** images that records point at but this device doesn't have yet (new from another device) – fetched as part of a manual sync, never lazily */
+async function fetchMissingImages() {
+  const refs = []; if (db.settings.logo) refs.push(db.settings.logo); db.expenses.forEach(x => { if (x.receipt) refs.push(x.receipt); });
+  for (const ref of [...new Set(refs)].filter(r => /^img:[A-Za-z0-9_-]+$/.test(r))) {
+    if (IMG[ref] || await idbGet(ref)) continue;
+    const r = await apiCall(ref.replace(':', '/')); if (r.status === 401) return; if (r.ok && /^data:image\//.test(r.text)) { IMG[ref] = r.text; await idbSet(ref, r.text); }
+  }
+  hydrateImages();
 }
 /** merge the server's full state into local data. Records changed locally since they were sent stay local (and stay queued). */
 function applyRemote(state, sent) {
@@ -1135,11 +1171,13 @@ function applyRemote(state, sent) {
   }
   KEYS.forEach(writeKey); writeSync(); return changed;
 }
+/** ONE full two-way merge, only when asked. `manual` is false only for the optional "auto-sync when app opens" setting. */
 async function syncNow(manual) {
-  if (!getTok() || !appStarted) return;
-  if (syncing) { syncAgain = true; return; }
-  if (!S.cloudInit) return initialSync();
-  if (navigator.onLine === false) { setSync('offline'); return; }
+  if (!appStarted) return;
+  if (!getTok()) { setSync('locked'); showLock(); return; }
+  if (syncing) return;
+  if (navigator.onLine === false) { setSync('error', "You're offline – connect and press Sync data again. Your changes are safe on this device."); if (manual) toast("You're offline – nothing was synced"); return; }
+  if (!S.cloudInit) return initialSync(manual);
   syncing = true; setSync('syncing');
   try {
     await uploadPendingImages();
@@ -1148,38 +1186,38 @@ async function syncNow(manual) {
     const r = await apiCall('sync', { method: 'POST', body: { changes } });
     if (r.status === 401) return;
     if (!r.ok) throw new Error((r.json && r.json.error) || 'Server said HTTP ' + r.status);
-    const changed = applyRemote(r.json, sent); S.lastSync = Date.now(); writeSync(); setSync('synced');
-    if (changed) { softRender(); }
-  } catch (e) { if (isNet(e)) setSync('offline'); else { console.warn('sync failed', e); setSync('error', 'Sync failed: ' + (e.message || e)); } }
-  finally { syncing = false; if (syncAgain) { syncAgain = false; scheduleSync(300); } }
+    const changed = applyRemote(r.json, sent); await fetchMissingImages(); S.lastSync = Date.now(); syncedThisPage = true; writeSync(); syncing = false; setSync('synced');
+    if (changed) softRender(); if (manual !== false) toast('Synced ' + hhmm(S.lastSync));
+  } catch (e) { if (isNet(e)) { setSync('error', "Couldn't reach the server – check your connection and press Sync data again."); if (manual) toast("Couldn't reach the server – nothing was lost, try again"); } else { console.warn('sync failed', e); setSync('error', 'Sync failed: ' + (e.message || e)); if (manual) toast('Sync failed: ' + (e.message || e)); } }
+  finally { syncing = false; paintSync(); }
 }
-async function initialSync() {
+async function initialSync(manual) {
   if (syncing) return; syncing = true; setSync('syncing');
   try {
-    const r = await apiCall('data'); if (r.status === 401) return; if (!r.ok) throw new Error((r.json && r.json.error) || 'Server said HTTP ' + r.status);
+    const r = await apiCall('data'); if (r.status === 401) { syncing = false; return; } if (!r.ok) throw new Error((r.json && r.json.error) || 'Server said HTTP ' + r.status);
     const cloud = r.json; const cloudHas = KEYS.some(k => k !== 'settings' && (cloud.collections[k] || []).some(x => !x.deleted));
-    const finish = () => { S.cloudInit = true; writeSync(); syncing = false; maybeSeed(); render(); syncNow(); };
-    if (!hasLocalData()) { const cinit = S.cloudInit; resetSyncMeta(); S.cloudInit = cinit; applyRemote(cloud, {}); finish(); return; }
+    const cloudKnowsSeeds = ['clients', 'items'].some(k => (cloud.collections[k] || []).length);
+    const finish = () => { S.cloudInit = true; writeSync(); syncing = false; maybeSeed(); render(); syncNow(manual); };
+    const dropSeeds = () => { db.clients = db.clients.filter(c => c.id !== SEED_CLIENT); db.items = db.items.filter(i => i.id !== SEED_ITEM); };
+    const reseedIfEmptyCloud = () => { if (!cloudKnowsSeeds && !db.clients.length && !db.items.length) addSeedsClean(); };
+    if (!hasLocalData()) { const cinit = S.cloudInit; dropSeeds(); resetSyncMeta(); S.cloudInit = cinit; applyRemote(cloud, {}); reseedIfEmptyCloud(); finish(); return; }
     const n = db.invoices.length, nc = db.clients.length, ne = db.expenses.length;
     const mine = `<b>${n}</b> invoice${n === 1 ? '' : 's'}/estimate${n === 1 ? '' : 's'}, <b>${nc}</b> client${nc === 1 ? '' : 's'} and <b>${ne}</b> expense${ne === 1 ? '' : 's'}`;
     syncing = false;
+    const queueAll = () => { KEYS.forEach(k => { Object.keys(snap(k)).forEach(id => { S.dirty[k][id] = 1; }); }); S.cloudInit = true; writeSync(); setTimeout(() => syncNow(manual), 50); };
+    const cloudOnly = () => { if (!confirm('Replace everything on this device with the cloud copy?')) return false; dropSeeds(); KEYS.forEach(k => { db[k] = clone(DEFAULTS[k]); }); resetSyncMeta(); applyRemote(cloud, {}); finish(); };
     if (!cloudHas) modal('Upload this device\'s data to the cloud', `<p style="margin-top:0">This browser already has ${mine} saved on it. Upload them so your phone and Mac share the same data?</p><p class="note">Your cloud store is empty, so nothing will be overwritten.</p>`,
-      [{ label: 'Upload to the cloud', cls: 'primary', fn: () => { KEYS.forEach(k => { Object.keys(snap(k)).forEach(id => { S.dirty[k][id] = 1; }); }); S.cloudInit = true; writeSync(); setTimeout(syncNow, 50); } },
-        { label: 'No – discard this device\'s data', cls: 'danger', fn: () => { if (!confirm('Discard everything saved on this device and start from the (empty) cloud?')) return false; resetSyncMeta(); KEYS.forEach(k => { db[k] = clone(DEFAULTS[k]); }); KEYS.forEach(writeKey); applyRemote(cloud, {}); finish(); } }], { sticky: true });
+      [{ label: 'Upload to the cloud', cls: 'primary', fn: queueAll },
+        { label: 'No – discard this device\'s data', cls: 'danger', fn: () => { if (!confirm('Discard everything saved on this device and start from the (empty) cloud?')) return false; KEYS.forEach(k => { db[k] = clone(DEFAULTS[k]); }); resetSyncMeta(); applyRemote(cloud, {}); finish(); } }], { sticky: true });
     else modal('Combine this device with the cloud', `<p style="margin-top:0">This browser has ${mine}, and the cloud already holds data from another device.</p><p class="note"><b>Merge</b> keeps everything from both (if the same record exists in both, the most recently edited one wins). <b>Use cloud only</b> replaces what's on this device.</p>`,
-      [{ label: 'Merge both', cls: 'primary', fn: () => { KEYS.forEach(k => { Object.keys(snap(k)).forEach(id => { S.dirty[k][id] = 1; }); }); S.cloudInit = true; writeSync(); setTimeout(syncNow, 50); } },
-        { label: 'Use cloud only', cls: 'danger', fn: () => { if (!confirm('Replace everything on this device with the cloud copy?')) return false; resetSyncMeta(); KEYS.forEach(k => { db[k] = clone(DEFAULTS[k]); }); applyRemote(cloud, {}); finish(); } }], { sticky: true });
+      [{ label: 'Merge both', cls: 'primary', fn: queueAll }, { label: 'Use cloud only', cls: 'danger', fn: cloudOnly }], { sticky: true });
     setSync('idle');
-  } catch (e) { syncing = false; if (isNet(e)) setSync('offline'); else setSync('error', 'Sync failed: ' + (e.message || e)); }
-}
-function startBackgroundSync() {
-  window.addEventListener('online', () => syncNow()); window.addEventListener('offline', () => setSync('offline'));
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') syncNow(); });
-  setInterval(() => { if (document.visibilityState === 'visible') syncNow(); }, 45000);
+  } catch (e) { syncing = false; if (isNet(e)) { setSync('error', "Couldn't reach the server – check your connection and press Sync data again."); if (manual) toast("Couldn't reach the server – try again"); } else { setSync('error', 'Sync failed: ' + (e.message || e)); if (manual) toast('Sync failed: ' + (e.message || e)); } }
+  finally { if (!syncing && syncSt === 'syncing') setSync('idle'); paintSync(); }
 }
 function cloudStatusHTML() {
-  const n = pendingCount(), lab = { synced: 'Synced', syncing: 'Syncing…', offline: 'Offline', error: 'Sync problem', locked: 'Locked', idle: 'Ready' }[syncSt];
-  return `<span class="badge ${syncSt === 'synced' ? 'b-paid' : syncSt === 'error' ? 'b-overdue' : syncSt === 'syncing' ? 'b-sent' : 'b-draft'}">${lab}</span> ${S.lastSync ? 'Last sync ' + new Date(S.lastSync).toLocaleString('en-GB', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : 'Not synced yet'}${n ? ` · <b>${n}</b> change${n === 1 ? '' : 's'} waiting` : ''}${syncSt === 'error' && syncMsg ? `<div class="note" style="color:var(--danger)">${esc(syncMsg)}</div>` : ''}`;
+  const l = syncLabel(), n = pendingCount(), cls = { ok: 'b-paid', err: 'b-overdue', busy: 'b-sent', warn: 'b-sent', off: 'b-draft' }[l[1]];
+  return `<span class="badge ${cls}">${esc(l[0])}</span>${S.lastSync ? ' Last sync ' + new Date(S.lastSync).toLocaleString('en-GB', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : ' Never synced'}${n ? ` · <b>${n}</b> change${n === 1 ? '' : 's'} waiting` : ''}${syncSt === 'error' && syncMsg ? `<div class="note" style="color:var(--danger)">${esc(syncMsg)}</div>` : ''}`;
 }
 
 /* ================= PDF (text-based, drawn with jsPDF) ================= */
@@ -1322,17 +1360,20 @@ ACT.googleConnect = () => {
     .catch(e => { out.innerHTML = `<span class="badge b-overdue">Not connected</span> ${esc(e.message)}`; });
 };
 ACT.googleHelp = () => googleSetupHelp();
-ACT.lockDevice = () => { if (!confirm('Lock this device? You\'ll need your PIN to open the app again. (Anything not yet synced stays on this device.)')) return; try { localStorage.removeItem(TOK_KEY); } catch (e) { /* ignore */ } setSync('locked'); showLock(); };
+ACT.lockDevice = () => { if (!confirm('Lock this device? You\'ll need your PIN to open the app again. (Anything not yet synced stays on this device – press Sync data first if you want it in the cloud.)')) return; try { localStorage.removeItem(TOK_KEY); } catch (e) { /* ignore */ } setSync('locked'); showLock(); };
+
+document.addEventListener('change', e => { if (e.target.id === 'autoSyncOpen') { try { localStorage.setItem(AUTO_KEY, e.target.checked ? '1' : '0'); } catch (x) { /* ignore */ } toast(e.target.checked ? 'The app will sync once each time it opens' : 'Auto-sync when opening is off'); } });
 
 /* ================= boot ================= */
 function enterApp() {
   document.body.classList.remove('locked'); const l = $('#lock'); if (l) l.remove();
-  if (!appStarted) { appStarted = true; buildShell(); startBackgroundSync(); if (!location.hash) location.hash = '#/dashboard'; }
+  if (!appStarted) { appStarted = true; buildShell(); if (!location.hash) location.hash = '#/dashboard'; }
   if (db.settings.logo) loadImg(db.settings.logo);
   if (hasGoogleId()) loadGis().catch(() => {});
-  render(); paintSync(); syncNow();
+  render(); paintSync();
+  if (autoOpen() && S.cloudInit) syncNow(false); // opt-in only (Settings → Cloud sync); never on by default
 }
-function boot() { load(); if (getTok()) enterApp(); else showLock(); }
+function boot() { load(); if (!db.settings.seeded) maybeSeed(); if (getTok()) enterApp(); else showLock(); }
 boot();
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('sw.js').catch(() => {});
 window.__igg = { db: () => db, S: () => S, L, render, syncNow, state: () => ({ ed, imp, syncSt }), IMG, save, saveAll, makePdf, newDoc, uid, saveImg, loadImg, docOf };

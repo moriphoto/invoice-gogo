@@ -1,5 +1,5 @@
 /* Invoice GoGo service worker – offline app shell. Bump VERSION on every release. */
-const VERSION = 'igg-v2';
+const VERSION = 'igg-v3';
 const SHELL = ['./', 'index.html', 'style.css', 'logic.js', 'pdf.js', 'vendor/jspdf.umd.min.js', 'app.js', 'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(VERSION).then(c => Promise.allSettled(SHELL.map(u => c.add(u)))).then(() => self.skipWaiting())); // tolerate a missing optional file

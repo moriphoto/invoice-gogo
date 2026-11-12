@@ -1,13 +1,15 @@
 # Invoice GoGo
 
 A simple, installable (PWA) invoicing app for freelancers – invoices, estimates, clients, projects, items, expenses, cash flow and reports.
-Vanilla HTML + CSS + JS, **no build step** for the app. v2 adds a PIN lock, cloud sync (Netlify Functions + Netlify Blobs), email-from-Gmail and save-to-Google-Drive.
+Vanilla HTML + CSS + JS, **no build step** for the app. v2 added a PIN lock, cloud sync (Netlify Functions + Netlify Blobs), email-from-Gmail and save-to-Google-Drive. v3 makes cloud sync **manual only** to keep Netlify free-plan usage tiny.
 
 Built for James Moriarty (freelance product photography & video, Cornwall) to work alongside the
 [Sewing Studio Timesheet](https://sewing-studio-timesheet.netlify.app/): export the timesheet's *Backup JSON* or *CSV*, import it here, pick a date range and turn the hours into an invoice. Imported sessions are remembered so they are never invoiced twice.
 
 ## How it fits together
-- **Browser** keeps a local copy (`localStorage` keys `igg_*`, images in IndexedDB) so it works offline, and syncs it to the server: on load, ~1.5 s after each change, every 45 s, and when the device comes back online. Per-record `updatedAt`, last write wins; deletions are tombstones. Top-bar pill: *Synced / Syncing / Offline · n waiting / Sync problem / Locked*.
+- **Browser** keeps the working copy (`localStorage` keys `igg_*`, images in IndexedDB), so everyday use needs no network at all.
+- **Sync is MANUAL ONLY.** Nothing talks to `/api/*` by itself: no sync on load, none after edits, no timer, no "back online" trigger, and signing in doesn't sync. Press **Sync data** (green button in the grey top bar, desktop and phone) to do one full two-way merge (per-record `updatedAt`, last write wins, deletions are tombstones). The pill beside it says *Not synced yet*, *Unsynced changes (n)*, *Synced hh:mm* (just synced) or *Not synced since hh:mm* (after a reload), plus *Locked* / *Sync failed*. The very first press on a device that already holds data offers *upload / merge / use cloud only*. Optional per-device switch in **Settings → Cloud sync & security**: *Auto-sync when the app opens* (default **off**).
+- The only `/api/*` calls the app makes: `GET /api/status` (lock screen), `POST /api/setup|login` (signing in), `POST /api/change-pin`, and on a Sync press `GET /api/data` (first press only) + `POST /api/sync` + one `PUT`/`GET /api/img/*` per new logo/receipt image. Typical use (about 3 invoices a month) is a handful of function calls. Gmail send and Drive save go straight to Google and never trigger a cloud sync. `tests/idle.e2e.js` proves the "nothing in the background" claim (see below).
 - **Server** = one Netlify Function (`netlify/functions/api.mjs`, logic in `netlify/lib/handler.mjs`) under `/api/*`, storing everything in Netlify Blobs (`igg-data`: one blob per collection; `igg-img`: one blob per logo/receipt image; `igg-auth`: PIN hash, signing key, rate-limit counters).
 - **Lock**: first visit creates the PIN (salted scrypt hash only). `POST /api/login` returns an HMAC-signed 30-day token; every other route needs it. Failed attempts are rate-limited per IP (5 → 15 min, doubling) with a global brake. Changing the PIN signs every other device out.
 - **Gmail / Drive** run entirely in the browser with Google Identity Services (token model) and the Gmail/Drive REST APIs – tokens are never sent to our server. Scopes: `gmail.send`, `drive.file`.
@@ -38,7 +40,8 @@ node tools/dev-server.mjs 8765    # static app + the real API handler on an in-m
 node tests/server.test.mjs        # API unit tests (auth, rate limit, sync, images)
 TZ=Europe/London node tests/logic.test.js
 NODE_PATH=<dir with puppeteer-core> TZ=Europe/London node tests/e2e.js         # UI flows
-NODE_PATH=<dir with puppeteer-core> TZ=Europe/London node tests/cloud.e2e.js   # lock, 2-device sync, offline, migration, Gmail/Drive (canned Google responses), PDFs
+NODE_PATH=<dir with puppeteer-core> TZ=Europe/London node tests/cloud.e2e.js   # lock, manual two-device sync, offline, migration, Gmail/Drive (canned Google responses), PDFs
+NODE_PATH=<dir with puppeteer-core> TZ=Europe/London node tests/idle.e2e.js    # 3 min idle + 3 min editing through the UI: zero /api requests (server log + browser), then one press = one POST /api/sync
 tools/make-deploy-dir.sh /tmp/igg-deploy   # clean deploy folder (no tests / node_modules / secrets)
 ```
 The Google tests use a fake `window.google` and request interception with canned responses as a *test harness*; the app itself never fakes success.
@@ -51,5 +54,6 @@ The Google tests use a fake `window.google` and request interception with canned
 
 ## Notes
 - Overdue = a **sent**, unpaid invoice past its due date (drafts never go overdue). Income in reports is counted when an invoice is marked **paid** (cash basis). Not tax advice.
-- Invoice numbers are allocated locally; two devices creating invoices *while both offline* can end up with the same number – check numbering after working offline on two devices.
+- Invoice numbers are allocated locally; two devices creating invoices *before syncing with each other* can end up with the same number – press **Sync data** before creating invoices on a second device (and after creating them on the first).
+- Because sync is manual, an unsynced device is a single copy: press **Sync data** before clearing browser data, and use *Settings → Download backup* as a second safety net.
 - Invoice2go is a trademark of its owner; this project is independent and uses its own name and visuals.
